@@ -1,4 +1,4 @@
-#![allow(unused)]
+#![allow(dead_code)]
 
 use std::env;
 use std::fs;
@@ -141,6 +141,8 @@ struct Description {
     text: Option<String>,
 }
 
+// ── Child-accessor methods ─────────────────────────────────────────────────────
+
 impl Protocol {
     fn interfaces(&self) -> Vec<&Interface> {
         self.items
@@ -153,17 +155,108 @@ impl Protocol {
     }
 }
 
-fn open(s: &str) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
-    let out_dir = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
-    let mut path = std::path::PathBuf::from(out_dir);
-    path.push(s);
-    Ok(std::io::BufWriter::new(
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)?,
-    ))
+impl Interface {
+    fn requests(&self) -> Vec<&Request> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                InterfaceItem::Request(r) => Some(r),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn events(&self) -> Vec<&Event> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                InterfaceItem::Event(e) => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl Request {
+    fn args(&self) -> Vec<&Arg> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                RequestItem::Arg(a) => Some(a),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl Event {
+    fn args(&self) -> Vec<&Arg> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                EventItem::Arg(a) => Some(a),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl Arg {
+    /// Rust type for an event struct field.
+    fn rust_type(&self) -> &str {
+        match self.arg_type.as_str() {
+            "int" | "fixed" => "i32",
+            "uint" | "object" | "new_id" => "u32",
+            "string" => "String",
+            "array" => "Vec<u8>",
+            "fd" => "std::os::unix::io::OwnedFd",
+            _ => "u32",
+        }
+    }
+
+    /// Rust type for a request method parameter.
+    fn param_type(&self) -> &str {
+        match self.arg_type.as_str() {
+            "int" | "fixed" => "i32",
+            "uint" => "u32",
+            "object" | "new_id" => "impl crate::object::Object",
+            "string" => "&str",
+            "array" => "&[u8]",
+            "fd" => "std::os::unix::io::OwnedFd",
+            _ => "u32",
+        }
+    }
+
+    /// Encode expression for a named parameter.
+    fn encode(&self, param: &str) -> String {
+        match self.arg_type.as_str() {
+            "uint" => format!("crate::wire::write_u32(&mut args, {});", param),
+            "object" | "new_id" => {
+                format!("crate::wire::write_u32(&mut args, {}.object_id());", param)
+            }
+            "int" | "fixed" => {
+                format!("crate::wire::write_u32(&mut args, {} as u32);", param)
+            }
+            "string" => format!("crate::wire::write_string(&mut args, {});", param),
+            "array" => format!(
+                "{{ let _arr = {}; crate::wire::write_u32(&mut args, _arr.len() as u32); \
+                 args.extend_from_slice(_arr); \
+                 let _pad = (4 - (_arr.len() % 4)) % 4; for _ in 0.._pad {{ args.push(0); }} }}",
+                param
+            ),
+            "fd" => format!(
+                "fds.push(std::os::unix::io::IntoRawFd::into_raw_fd({}));",
+                param
+            ),
+            _ => format!("crate::wire::write_u32(&mut args, {});", param),
+        }
+    }
+}
+
+// ── Name helpers ───────────────────────────────────────────────────────────────
+
+fn to_const_name(s: &str) -> String {
+    s.to_ascii_uppercase().replace('-', "_")
 }
 
 /// Prefix Rust keywords with `r#` so they can be used as identifiers.
@@ -190,134 +283,90 @@ fn to_pascal_case(s: &str) -> String {
         .collect()
 }
 
-/// Rust type for an event struct field.
-fn arg_rust_type(arg: &Arg) -> &str {
-    match arg.arg_type.as_str() {
-        "int" | "fixed" => "i32",
-        "uint" | "object" | "new_id" => "u32",
-        "string" => "String",
-        "array" => "Vec<u8>",
-        "fd" => "i32",
-        _ => "u32",
+// ── Named return types ─────────────────────────────────────────────────────────
+
+struct RequestBody {
+    extra_params: String,
+    body_stmts: String,
+    send_call: String,
+    has_fds: bool,
+}
+
+struct DecodeResult {
+    stmts: String,
+    field_names: Vec<String>,
+}
+
+// ── Offset state machine ───────────────────────────────────────────────────────
+
+struct OffsetTracker {
+    fixed: usize,
+    dynamic: Option<String>,
+}
+
+impl OffsetTracker {
+    fn new() -> Self {
+        OffsetTracker { fixed: 0, dynamic: None }
+    }
+
+    fn current(&self) -> String {
+        match &self.dynamic {
+            None => self.fixed.to_string(),
+            Some(v) => v.clone(),
+        }
+    }
+
+    /// Advance by 4 bytes for a fixed-size field at position `i`.
+    /// Returns an offset binding statement to emit when dynamic tracking is
+    /// active; `None` when the offset is still a compile-time literal.
+    fn advance_fixed(&mut self, i: usize) -> Option<String> {
+        if self.dynamic.is_none() {
+            self.fixed += 4;
+            None
+        } else {
+            let nv = format!("_off{}", i);
+            let stmt = format!(
+                "                let {} = {} + 4;\n",
+                nv,
+                self.dynamic.as_ref().unwrap()
+            );
+            self.dynamic = Some(nv);
+            Some(stmt)
+        }
+    }
+
+    fn set_dynamic(&mut self, var: String) {
+        self.dynamic = Some(var);
     }
 }
 
-/// Rust type for a request method parameter.
-fn arg_param_type(arg: &Arg) -> &str {
-    match arg.arg_type.as_str() {
-        "int" | "fixed" => "i32",
-        "uint" => "u32",
-        "object" | "new_id" => "impl crate::object::Object",
-        "string" => "&str",
-        "array" => "&[u8]",
-        "fd" => "i32",
-        _ => "u32",
-    }
-}
+// ── Data builders ─────────────────────────────────────────────────────────────
 
-/// Encode expression for a named parameter.
-fn arg_encode(arg: &Arg, param: &str) -> String {
-    match arg.arg_type.as_str() {
-        "uint" => {
-            format!("crate::wire::write_u32(&mut args, {});", param)
-        }
-        "object" | "new_id" => {
-            format!("crate::wire::write_u32(&mut args, {}.object_id());", param)
-        }
-        "int" | "fixed" => {
-            format!("crate::wire::write_u32(&mut args, {} as u32);", param)
-        }
-        "string" => {
-            format!("crate::wire::write_string(&mut args, {});", param)
-        }
-        "array" => format!(
-            "{{ let _arr = {}; crate::wire::write_u32(&mut args, _arr.len() as u32); \
-             args.extend_from_slice(_arr); \
-             let _pad = (4 - (_arr.len() % 4)) % 4; for _ in 0.._pad {{ args.push(0); }} }}",
-            param
-        ),
-        "fd" => "unimplemented!(\"fd passing not supported\");".to_string(),
-        _ => format!("crate::wire::write_u32(&mut args, {});", param),
-    }
-}
-
-fn request_args(req: &Request) -> Vec<&Arg> {
-    req.items
-        .iter()
-        .filter_map(|item| match item {
-            RequestItem::Arg(a) => Some(a),
-            _ => None,
-        })
-        .collect()
-}
-
-fn event_args(evt: &Event) -> Vec<&Arg> {
-    evt.items
-        .iter()
-        .filter_map(|item| match item {
-            EventItem::Arg(a) => Some(a),
-            _ => None,
-        })
-        .collect()
-}
-
-fn has_untyped_new_id(args: &[&Arg]) -> bool {
-    args.iter()
-        .any(|a| a.arg_type == "new_id" && a.interface.is_none())
-}
-
-// ── Code generators ──────────────────────────────────────────────────────────
-
-fn emit_request_method(
-    f: &mut impl Write,
-    iface_name: &str,
-    req: &Request,
-) -> std::io::Result<()> {
-    let args = request_args(req);
-    let method_name = escape_keyword(&req.name.replace('-', "_"));
-    let opcode_path = format!(
-        "{}::request::{}",
-        iface_name,
-        req.name.to_ascii_uppercase().replace('-', "_")
-    );
+/// Builds the variable parts of a request method body.
+fn build_request_body(iface_name: &str, req: &Request) -> RequestBody {
+    let args = req.args();
+    let has_fds = args.iter().any(|a| a.arg_type == "fd");
+    let opcode_path = format!("{}::request::{}", iface_name, to_const_name(&req.name));
 
     let mut params = String::new();
     let mut encode_lines: Vec<String> = Vec::new();
 
-    if has_untyped_new_id(&args) {
-        // Expand untyped new_id into three params: interface, version, id
-        for arg in &args {
-            if arg.arg_type == "fd" {
-                continue;
+    for arg in &args {
+        if arg.arg_type == "new_id" && arg.interface.is_none() {
+            if !params.is_empty() {
+                params.push_str(", ");
             }
-            if arg.arg_type == "new_id" && arg.interface.is_none() {
-                if !params.is_empty() {
-                    params.push_str(", ");
-                }
-                params.push_str("interface: &str, version: u32, id: impl crate::object::Object");
-                encode_lines.push("crate::wire::write_string(&mut args, interface);".to_string());
-                encode_lines.push("crate::wire::write_u32(&mut args, version);".to_string());
-                encode_lines.push("crate::wire::write_u32(&mut args, id.object_id());".to_string());
-            } else {
-                let pname = escape_keyword(&arg.name);
-                if !params.is_empty() {
-                    params.push_str(", ");
-                }
-                params.push_str(&format!("{}: {}", pname, arg_param_type(arg)));
-                encode_lines.push(arg_encode(arg, &pname));
-            }
-        }
-    } else {
-        for arg in &args {
-            if arg.arg_type == "fd" {
-                continue;
-            }
+            params.push_str("interface: &str, version: u32, id: impl crate::object::Object");
+            encode_lines.push("crate::wire::write_string(&mut args, interface);".to_string());
+            encode_lines.push("crate::wire::write_u32(&mut args, version);".to_string());
+            encode_lines.push("crate::wire::write_u32(&mut args, id.object_id());".to_string());
+        } else {
             let pname = escape_keyword(&arg.name);
             if !params.is_empty() {
                 params.push_str(", ");
             }
-            params.push_str(&format!("{}: {}", pname, arg_param_type(arg)));
-            encode_lines.push(arg_encode(arg, &pname));
+            params.push_str(&format!("{}: {}", pname, arg.param_type()));
+            encode_lines.push(arg.encode(&pname));
         }
     }
 
@@ -327,361 +376,430 @@ fn emit_request_method(
         format!(", {}", params)
     };
 
-    writeln!(
-        f,
-        "    fn {}(&self, conn: &mut crate::connection::Connection{}) -> std::io::Result<()> {{",
-        method_name, extra_params
-    )?;
-    writeln!(
-        f,
-        "        tracing::debug!(object_id = self.object_id(), opcode = {}, \"{}.{}\");",
-        opcode_path,
-        iface_name,
-        req.name.replace('-', "_"),
-    )?;
-    if encode_lines.is_empty() {
-        writeln!(f, "        let args: &[u8] = &[];")?;
+    let body_stmts = if encode_lines.is_empty() {
+        "        let args: &[u8] = &[];\n".to_string()
     } else {
-        writeln!(f, "        let mut args = Vec::new();")?;
-        for line in &encode_lines {
-            writeln!(f, "        {}", line)?;
+        let mut s = "        let mut args = Vec::new();\n".to_string();
+        if has_fds {
+            s.push_str(
+                "        let mut fds: Vec<std::os::unix::io::RawFd> = Vec::new();\n",
+            );
         }
-    }
-    writeln!(
-        f,
-        "        conn.send_msg(self.object_id(), {}, &args)",
-        opcode_path
-    )?;
-    writeln!(f, "    }}")?;
-    writeln!(f)?;
-    Ok(())
+        for line in &encode_lines {
+            s.push_str(&format!("        {}\n", line));
+        }
+        s
+    };
+
+    let send_call = if has_fds {
+        format!(
+            "conn.send_msg_with_fds(self.object_id(), {}, &args, &fds)",
+            opcode_path
+        )
+    } else {
+        format!("conn.send_msg(self.object_id(), {}, &args)", opcode_path)
+    };
+
+    RequestBody { extra_params, body_stmts, send_call, has_fds }
 }
 
-fn emit_dispatch(f: &mut impl Write, iface_name: &str, events: &[&Event]) -> std::io::Result<()> {
-    // Decide whether body will actually be read in any arm.
-    let any_args = events.iter().any(|evt| {
-        event_args(evt)
-            .into_iter()
-            .any(|a| a.arg_type != "fd")
-    });
-    let body_param = if any_args { "body" } else { "_body" };
+/// Decodes event args into variable-binding statements.
+/// Each decode stmt has 16-space indent.
+fn build_decode_stmts(args: &[&Arg]) -> DecodeResult {
+    let mut tracker = OffsetTracker::new();
+    let mut field_names: Vec<String> = Vec::new();
+    let mut stmts = String::new();
 
-    writeln!(f, "    fn dispatch(&mut self, opcode: u16, {}: &[u8]) {{", body_param)?;
+    for (i, arg) in args.iter().enumerate() {
+        let var = escape_keyword(&arg.name);
+        field_names.push(var.clone());
 
-    if events.is_empty() {
-        writeln!(f, "        let _ = opcode;")?;
-        writeln!(f, "    }}")?;
-        return Ok(());
-    }
+        if arg.arg_type == "fd" {
+            stmts.push_str(&format!(
+                "                let {} = conn.pop_fd()?;\n",
+                var
+            ));
+            continue;
+        }
 
-    writeln!(f, "        match opcode {{")?;
+        let cur_off = tracker.current();
 
-    for evt in events {
-        let args = event_args(evt);
-        let args_no_fd: Vec<&Arg> = args.iter().copied().filter(|a| a.arg_type != "fd").collect();
-        let opcode_const = format!(
-            "{}::event::{}",
-            iface_name,
-            evt.name.to_ascii_uppercase().replace('-', "_")
-        );
-        let cb_name = format!("on_{}", evt.name.replace('-', "_"));
-
-        writeln!(f, "            {} => {{", opcode_const)?;
-        writeln!(
-            f,
-            "                tracing::trace!(opcode = {}, \"{}.{}\");",
-            opcode_const,
-            iface_name,
-            evt.name.replace('-', "_"),
-        )?;
-
-        if args_no_fd.is_empty() {
-            writeln!(f, "                self.{}();", cb_name)?;
-        } else {
-            // Decode each argument in order, tracking offset as literal or variable.
-            // off_var = None means use off_lit (a constant known at codegen time).
-            // off_var = Some(name) means use a runtime variable.
-            let mut off_var: Option<String> = None;
-            let mut off_lit: usize = 0;
-            let mut field_names: Vec<String> = Vec::new();
-
-            for (i, arg) in args_no_fd.iter().enumerate() {
-                let var = escape_keyword(&arg.name);
-                field_names.push(var.clone());
-
-                let cur_off = match &off_var {
-                    None => off_lit.to_string(),
-                    Some(v) => v.clone(),
-                };
-
-                match arg.arg_type.as_str() {
-                    "uint" | "object" | "new_id" => {
-                        writeln!(
-                            f,
-                            "                let {} = crate::wire::read_u32(body, {});",
-                            var, cur_off
-                        )?;
-                        if off_var.is_none() {
-                            off_lit += 4;
-                        } else {
-                            let nv = format!("_off{}", i);
-                            writeln!(
-                                f,
-                                "                let {} = {} + 4;",
-                                nv,
-                                off_var.as_ref().unwrap()
-                            )?;
-                            off_var = Some(nv);
-                        }
-                    }
-                    "int" | "fixed" => {
-                        writeln!(
-                            f,
-                            "                let {} = crate::wire::read_u32(body, {}) as i32;",
-                            var, cur_off
-                        )?;
-                        if off_var.is_none() {
-                            off_lit += 4;
-                        } else {
-                            let nv = format!("_off{}", i);
-                            writeln!(
-                                f,
-                                "                let {} = {} + 4;",
-                                nv,
-                                off_var.as_ref().unwrap()
-                            )?;
-                            off_var = Some(nv);
-                        }
-                    }
-                    "string" => {
-                        let nv = format!("_off{}", i);
-                        writeln!(
-                            f,
-                            "                let ({}, {}) = crate::wire::read_string(body, {});",
-                            var, nv, cur_off
-                        )?;
-                        off_var = Some(nv);
-                    }
-                    "array" => {
-                        let len_var = format!("_arr_len{}", i);
-                        let nv = format!("_off{}", i);
-                        writeln!(
-                            f,
-                            "                let {} = crate::wire::read_u32(body, {}) as usize;",
-                            len_var, cur_off
-                        )?;
-                        writeln!(
-                            f,
-                            "                let {} = body[{} + 4..{} + 4 + {}].to_vec();",
-                            var, cur_off, cur_off, len_var
-                        )?;
-                        writeln!(
-                            f,
-                            "                let {} = {} + 4 + {} + (4 - ({} % 4)) % 4;",
-                            nv, cur_off, len_var, len_var
-                        )?;
-                        off_var = Some(nv);
-                    }
-                    _ => {
-                        writeln!(
-                            f,
-                            "                let {} = crate::wire::read_u32(body, {});",
-                            var, cur_off
-                        )?;
-                        if off_var.is_none() {
-                            off_lit += 4;
-                        } else {
-                            let nv = format!("_off{}", i);
-                            writeln!(
-                                f,
-                                "                let {} = {} + 4;",
-                                nv,
-                                off_var.as_ref().unwrap()
-                            )?;
-                            off_var = Some(nv);
-                        }
-                    }
+        match arg.arg_type.as_str() {
+            "uint" | "object" | "new_id" => {
+                stmts.push_str(&format!(
+                    "                let {} = crate::wire::read_u32(body, {});\n",
+                    var, cur_off
+                ));
+                if let Some(off_stmt) = tracker.advance_fixed(i) {
+                    stmts.push_str(&off_stmt);
                 }
             }
-
-            let iface_pascal = to_pascal_case(iface_name);
-            let struct_name = format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
-            let fields = field_names.join(", ");
-            writeln!(
-                f,
-                "                self.{}({} {{ {} }});",
-                cb_name, struct_name, fields
-            )?;
+            "int" | "fixed" => {
+                stmts.push_str(&format!(
+                    "                let {} = crate::wire::read_u32(body, {}) as i32;\n",
+                    var, cur_off
+                ));
+                if let Some(off_stmt) = tracker.advance_fixed(i) {
+                    stmts.push_str(&off_stmt);
+                }
+            }
+            "string" => {
+                let nv = format!("_off{}", i);
+                stmts.push_str(&format!(
+                    "                let ({}, {}) = crate::wire::read_string(body, {});\n",
+                    var, nv, cur_off
+                ));
+                tracker.set_dynamic(nv);
+            }
+            "array" => {
+                let len_var = format!("_arr_len{}", i);
+                let nv = format!("_off{}", i);
+                stmts.push_str(&format!(
+                    "                let {} = crate::wire::read_u32(body, {}) as usize;\n",
+                    len_var, cur_off
+                ));
+                stmts.push_str(&format!(
+                    "                let {} = body[{} + 4..{} + 4 + {}].to_vec();\n",
+                    var, cur_off, cur_off, len_var
+                ));
+                stmts.push_str(&format!(
+                    "                let {} = {} + 4 + {} + (4 - ({} % 4)) % 4;\n",
+                    nv, cur_off, len_var, len_var
+                ));
+                tracker.set_dynamic(nv);
+            }
+            _ => {
+                stmts.push_str(&format!(
+                    "                let {} = crate::wire::read_u32(body, {});\n",
+                    var, cur_off
+                ));
+                if let Some(off_stmt) = tracker.advance_fixed(i) {
+                    stmts.push_str(&off_stmt);
+                }
+            }
         }
-
-        writeln!(f, "            }}")?;
     }
 
-    writeln!(f, "            _ => {{}}")?;
-    writeln!(f, "        }}")?;
-    writeln!(f, "    }}")?;
+    DecodeResult { stmts, field_names }
+}
+
+// ── Snippet functions ─────────────────────────────────────────────────────────
+
+/// Pass-1 constant module for one interface.
+fn snippet_const_module(
+    iface_name: &str,
+    version: u32,
+    req_consts: &str,
+    evt_consts: &str,
+) -> String {
+    let req_block = if req_consts.is_empty() {
+        String::new()
+    } else {
+        format!("    pub mod request {{\n{req_consts}    }}\n")
+    };
+    let evt_block = if evt_consts.is_empty() {
+        String::new()
+    } else {
+        format!("    pub mod event {{\n{evt_consts}    }}\n")
+    };
+    format!(
+        "pub mod {iface_name} {{\n    pub const INTERFACE: &str = {iface_name:?};\n    pub const VERSION: u32 = {version};\n{req_block}{evt_block}}}\n\n"
+    )
+}
+
+/// Event struct with one or more fields.
+fn snippet_event_struct(struct_name: &str, fields: &str) -> String {
+    format!(
+        r#"pub struct {struct_name} {{
+{fields}}}
+
+"#
+    )
+}
+
+/// Concrete object struct + Object impl.
+fn snippet_concrete_type(pascal: &str) -> String {
+    format!(
+        r#"pub struct {pascal} {{
+    object_id: u32,
+}}
+
+impl {pascal} {{
+    pub fn new(object_id: u32) -> Self {{
+        {pascal} {{ object_id }}
+    }}
+}}
+
+impl crate::object::Object for {pascal} {{
+    fn object_id(&self) -> u32 {{ self.object_id }}
+}}
+
+"#
+    )
+}
+
+/// One request method inside a handler trait.
+/// `body_stmts` already has 8-space indentation and trailing newline(s).
+fn snippet_request_method(
+    method_name: &str,
+    extra_params: &str,
+    log_path: &str,
+    iface_name: &str,
+    req_name: &str,
+    body_stmts: &str,
+    send_call: &str,
+) -> String {
+    format!(
+        r#"    fn {method_name}(&self, conn: &mut crate::connection::Connection{extra_params}) -> std::io::Result<()> {{
+        tracing::debug!(object_id = self.object_id(), opcode = {log_path}, "{iface_name}.{req_name}");
+{body_stmts}        {send_call}
+    }}
+
+"#
+    )
+}
+
+/// One match arm inside dispatch.
+/// `decode_stmts` already has 16-space indentation and trailing newline (or is empty).
+fn snippet_dispatch_arm(
+    opcode_const: &str,
+    iface_name: &str,
+    evt_name: &str,
+    decode_stmts: &str,
+    call: &str,
+) -> String {
+    format!(
+        r#"            {opcode_const} => {{
+                tracing::trace!(opcode = {opcode_const}, "{iface_name}.{evt_name}");
+{decode_stmts}                {call};
+            }}
+"#
+    )
+}
+
+/// Full dispatch method for an interface that has at least one event.
+/// `match_arms` is the concatenation of `snippet_dispatch_arm` results.
+fn snippet_dispatch(conn_param: &str, body_param: &str, match_arms: &str) -> String {
+    format!(
+        r#"    fn dispatch(&mut self, {conn_param}: &mut crate::connection::Connection, opcode: u16, {body_param}: &[u8]) -> std::io::Result<()> {{
+        match opcode {{
+{match_arms}            _ => {{}}
+        }}
+        Ok(())
+    }}
+"#
+    )
+}
+
+/// Dispatch method for interfaces with no events.
+fn snippet_dispatch_empty() -> String {
+    "    fn dispatch(&mut self, _conn: &mut crate::connection::Connection, opcode: u16, _body: &[u8]) -> std::io::Result<()> {\n        let _ = opcode;\n        Ok(())\n    }\n".to_string()
+}
+
+/// Complete handler trait.
+/// `methods`   — concatenated request-method snippets (each ends with `\n\n`), or `""`.
+/// `callbacks` — concatenated `fn on_*(...);` lines (each ends with `\n`), or `""`.
+/// `dispatch`  — the dispatch snippet (ends with `\n`).
+fn snippet_handler_trait(
+    trait_name: &str,
+    methods: &str,
+    callbacks: &str,
+    dispatch: &str,
+) -> String {
+    // Blank line between callbacks and dispatch only when there are events.
+    let sep = if callbacks.is_empty() { "" } else { "\n" };
+    format!(
+        "pub trait {trait_name}: crate::object::Object {{\n\n{methods}{callbacks}{sep}{dispatch}}}\n\n"
+    )
+}
+
+// ── Protocol generator ────────────────────────────────────────────────────────
+
+fn emit_const_modules(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow::Result<()> {
+    for iface in interfaces {
+        let req_consts: String = iface
+            .requests()
+            .iter()
+            .enumerate()
+            .map(|(op, req)| {
+                format!("        pub const {}: u16 = {};\n", to_const_name(&req.name), op)
+            })
+            .collect();
+
+        let evt_consts: String = iface
+            .events()
+            .iter()
+            .enumerate()
+            .map(|(op, evt)| {
+                format!("        pub const {}: u16 = {};\n", to_const_name(&evt.name), op)
+            })
+            .collect();
+
+        write!(
+            f,
+            "{}",
+            snippet_const_module(&iface.name, iface.version, &req_consts, &evt_consts)
+        )?;
+    }
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    let filename = "wayland.xml";
+fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow::Result<()> {
+    for iface in interfaces {
+        let iface_pascal = to_pascal_case(&iface.name);
+        let requests = iface.requests();
+        let events = iface.events();
+
+        // Event structs (only for events with ≥1 arg)
+        for evt in &events {
+            let args = evt.args();
+            if args.is_empty() {
+                continue;
+            }
+            let struct_name = format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
+            let fields: String = args
+                .iter()
+                .map(|a| {
+                    format!(
+                        "    pub {}: {},\n",
+                        escape_keyword(&a.name),
+                        a.rust_type()
+                    )
+                })
+                .collect();
+            write!(f, "{}", snippet_event_struct(&struct_name, &fields))?;
+        }
+
+        // Concrete struct + Object impl
+        write!(f, "{}", snippet_concrete_type(&iface_pascal))?;
+
+        // Handler trait
+        let trait_name = format!("{}Handler", iface_pascal);
+
+        let methods: String = requests
+            .iter()
+            .map(|req| {
+                let method_name = escape_keyword(&req.name.replace('-', "_"));
+                let log_path =
+                    format!("{}::request::{}", iface.name, to_const_name(&req.name));
+                let req_name = req.name.replace('-', "_");
+                let rb = build_request_body(&iface.name, req);
+                snippet_request_method(
+                    &method_name,
+                    &rb.extra_params,
+                    &log_path,
+                    &iface.name,
+                    &req_name,
+                    &rb.body_stmts,
+                    &rb.send_call,
+                )
+            })
+            .collect();
+
+        let callbacks: String = events
+            .iter()
+            .map(|evt| {
+                let args = evt.args();
+                let cb_name = format!("on_{}", evt.name.replace('-', "_"));
+                if args.is_empty() {
+                    format!("    fn {}(&mut self);\n", cb_name)
+                } else {
+                    let struct_name =
+                        format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
+                    format!("    fn {}(&mut self, event: {});\n", cb_name, struct_name)
+                }
+            })
+            .collect();
+
+        let dispatch = if events.is_empty() {
+            snippet_dispatch_empty()
+        } else {
+            let any_body_args = events
+                .iter()
+                .any(|evt| evt.args().into_iter().any(|a| a.arg_type != "fd"));
+            let any_fd_args = events
+                .iter()
+                .any(|evt| evt.args().into_iter().any(|a| a.arg_type == "fd"));
+            let body_param = if any_body_args { "body" } else { "_body" };
+            let conn_param = if any_fd_args { "conn" } else { "_conn" };
+
+            let match_arms: String = events
+                .iter()
+                .map(|evt| {
+                    let args = evt.args();
+                    let opcode_const =
+                        format!("{}::event::{}", iface.name, to_const_name(&evt.name));
+                    let evt_name = evt.name.replace('-', "_");
+                    let cb_name = format!("on_{}", evt_name);
+
+                    let (decode_stmts, field_names) = if args.is_empty() {
+                        (String::new(), Vec::new())
+                    } else {
+                        let dr = build_decode_stmts(&args);
+                        (dr.stmts, dr.field_names)
+                    };
+
+                    let call = if args.is_empty() {
+                        format!("self.{}()", cb_name)
+                    } else {
+                        let struct_name = format!(
+                            "{}{}Event",
+                            iface_pascal,
+                            to_pascal_case(&evt.name)
+                        );
+                        let fields = field_names.join(", ");
+                        format!("self.{}({} {{ {} }})", cb_name, struct_name, fields)
+                    };
+
+                    snippet_dispatch_arm(
+                        &opcode_const,
+                        &iface.name,
+                        &evt_name,
+                        &decode_stmts,
+                        &call,
+                    )
+                })
+                .collect();
+
+            snippet_dispatch(conn_param, body_param, &match_arms)
+        };
+
+        write!(
+            f,
+            "{}",
+            snippet_handler_trait(&trait_name, &methods, &callbacks, &dispatch)
+        )?;
+    }
+    Ok(())
+}
+
+fn generate_protocol(f: &mut impl Write, filename: &str) -> anyhow::Result<()> {
     println!("cargo:rerun-if-changed={}", filename);
 
     let xml_content = fs::read_to_string(filename)
         .map_err(|e| anyhow::anyhow!("Failed to read '{}': {}", filename, e))?;
     let protocol: Protocol = from_str(&xml_content)?;
+    let interfaces = protocol.interfaces();
 
+    emit_const_modules(f, &interfaces)?;
+    emit_handler_traits(f, &interfaces)?;
+
+    Ok(())
+}
+
+fn open(s: &str) -> std::io::Result<std::io::BufWriter<std::fs::File>> {
+    let out_dir = env::var("OUT_DIR").unwrap_or_else(|_| ".".to_string());
+    let path = std::path::Path::new(&out_dir).join(s);
+    Ok(std::io::BufWriter::new(std::fs::File::create(path)?))
+}
+
+fn main() -> anyhow::Result<()> {
     let mut f = open("wayland_protocol.rs")?;
-    writeln!(f, "// Auto-generated from {}. DO NOT EDIT.", filename)?;
+    writeln!(f, "// Auto-generated. DO NOT EDIT.")?;
     writeln!(f)?;
 
-    // ── Pass 1: per-interface constant modules ────────────────────────────────
-    for iface in protocol.interfaces() {
-        let requests: Vec<&Request> = iface
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                InterfaceItem::Request(r) => Some(r),
-                _ => None,
-            })
-            .collect();
-
-        let events: Vec<&Event> = iface
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                InterfaceItem::Event(e) => Some(e),
-                _ => None,
-            })
-            .collect();
-
-        writeln!(f, "pub mod {} {{", iface.name)?;
-        writeln!(f, "    pub const INTERFACE: &str = {:?};", iface.name)?;
-        writeln!(f, "    pub const VERSION: u32 = {};", iface.version)?;
-
-        if !requests.is_empty() {
-            writeln!(f, "    pub mod request {{")?;
-            for (opcode, req) in requests.iter().enumerate() {
-                let const_name = req.name.to_ascii_uppercase().replace('-', "_");
-                writeln!(f, "        pub const {}: u16 = {};", const_name, opcode)?;
-            }
-            writeln!(f, "    }}")?;
-        }
-
-        if !events.is_empty() {
-            writeln!(f, "    pub mod event {{")?;
-            for (opcode, evt) in events.iter().enumerate() {
-                let const_name = evt.name.to_ascii_uppercase().replace('-', "_");
-                writeln!(f, "        pub const {}: u16 = {};", const_name, opcode)?;
-            }
-            writeln!(f, "    }}")?;
-        }
-
-        writeln!(f, "}}")?;
-        writeln!(f)?;
-    }
-
-    // ── Pass 2: event structs + handler traits ────────────────────────────────
-    for iface in protocol.interfaces() {
-        let iface_pascal = to_pascal_case(&iface.name);
-
-        let requests: Vec<&Request> = iface
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                InterfaceItem::Request(r) => Some(r),
-                _ => None,
-            })
-            .collect();
-
-        let events: Vec<&Event> = iface
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                InterfaceItem::Event(e) => Some(e),
-                _ => None,
-            })
-            .collect();
-
-        // Event structs (only for events with ≥1 non-fd arg)
-        for evt in &events {
-            let args: Vec<&Arg> = event_args(evt)
-                .into_iter()
-                .filter(|a| a.arg_type != "fd")
-                .collect();
-            if args.is_empty() {
-                continue;
-            }
-            let struct_name = format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
-            writeln!(f, "pub struct {} {{", struct_name)?;
-            for arg in &args {
-                writeln!(
-                    f,
-                    "    pub {}: {},",
-                    escape_keyword(&arg.name),
-                    arg_rust_type(arg)
-                )?;
-            }
-            writeln!(f, "}}")?;
-            writeln!(f)?;
-        }
-
-        // Concrete struct + Object impl
-        writeln!(f, "pub struct {} {{", iface_pascal)?;
-        writeln!(f, "    object_id: u32,")?;
-        writeln!(f, "}}")?;
-        writeln!(f)?;
-        writeln!(f, "impl {} {{", iface_pascal)?;
-        writeln!(f, "    pub fn new(object_id: u32) -> Self {{")?;
-        writeln!(f, "        {} {{ object_id }}", iface_pascal)?;
-        writeln!(f, "    }}")?;
-        writeln!(f, "}}")?;
-        writeln!(f)?;
-        writeln!(f, "impl crate::object::Object for {} {{", iface_pascal)?;
-        writeln!(f, "    fn object_id(&self) -> u32 {{ self.object_id }}")?;
-        writeln!(f, "}}")?;
-        writeln!(f)?;
-
-        // Handler trait
-        let trait_name = format!("{}Handler", iface_pascal);
-        writeln!(f, "pub trait {}: crate::object::Object {{", trait_name)?;
-        writeln!(f)?;
-
-        // Request methods (default impls)
-        for req in &requests {
-            emit_request_method(&mut f, &iface.name, req)?;
-        }
-
-        // Event callbacks (empty default impls)
-        for evt in &events {
-            let args: Vec<&Arg> = event_args(evt)
-                .into_iter()
-                .filter(|a| a.arg_type != "fd")
-                .collect();
-            let cb_name = format!("on_{}", evt.name.replace('-', "_"));
-            if args.is_empty() {
-                writeln!(f, "    fn {}(&mut self) {{}}", cb_name)?;
-            } else {
-                let struct_name = format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
-                writeln!(
-                    f,
-                    "    fn {}(&mut self, _event: {}) {{}}",
-                    cb_name, struct_name
-                )?;
-            }
-        }
-
-        if !events.is_empty() {
-            writeln!(f)?;
-        }
-
-        // Dispatch method
-        let events_refs: Vec<&Event> = events.iter().copied().collect();
-        emit_dispatch(&mut f, &iface.name, &events_refs)?;
-
-        writeln!(f, "}}")?;
-        writeln!(f)?;
-    }
+    generate_protocol(&mut f, "wayland.xml")?;
+    generate_protocol(&mut f, "xdg-shell.xml")?;
 
     Ok(())
 }
