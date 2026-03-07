@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 
 use tracing::trace;
 
@@ -19,18 +19,13 @@ pub fn write_u32(buf: &mut Vec<u8>, v: u32) {
     buf.extend_from_slice(&v.to_le_bytes());
 }
 
-pub fn send_msg(
-    stream: &mut impl Write,
-    object_id: u32,
-    opcode: u16,
-    args: &[u8],
-) -> io::Result<()> {
+pub fn send_msg(buf: &mut Vec<u8>, object_id: u32, opcode: u16, args: &[u8]) -> io::Result<()> {
     let total_size = (8 + args.len()) as u32;
     trace!(object_id, opcode, bytes = total_size, "→ send");
     let word2 = (total_size << 16) | (opcode as u32);
-    stream.write_all(&object_id.to_le_bytes())?;
-    stream.write_all(&word2.to_le_bytes())?;
-    stream.write_all(args)?;
+    buf.extend_from_slice(&object_id.to_le_bytes());
+    buf.extend_from_slice(&word2.to_le_bytes());
+    buf.extend_from_slice(args);
     Ok(())
 }
 

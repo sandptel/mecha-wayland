@@ -1,15 +1,18 @@
 use std::collections::VecDeque;
 use std::env;
-use std::io::{self, BufWriter, Read};
+use std::io;
+use std::mem;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+use io_uring::{opcode, types::Fd, IoUring};
 use tracing::{debug, info};
 
 pub struct Connection {
-    reader: UnixStream,
-    writer: BufWriter<UnixStream>,
+    socket: UnixStream,
+    ring: IoUring,
+    write_buf: Vec<u8>,
     next_id: u32,
     pending_fds: VecDeque<OwnedFd>,
 }
@@ -22,9 +25,15 @@ impl Connection {
     }
 
     pub fn connect_to(path: &Path) -> io::Result<Self> {
-        let stream = UnixStream::connect(path)?;
-        let writer = BufWriter::new(stream.try_clone()?);
-        Ok(Connection { reader: stream, writer, next_id: 2, pending_fds: VecDeque::new() })
+        let socket = UnixStream::connect(path)?;
+        let ring = IoUring::new(8).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(Connection {
+            socket,
+            ring,
+            write_buf: Vec::with_capacity(4096),
+            next_id: 2,
+            pending_fds: VecDeque::new(),
+        })
     }
 
     fn resolve_socket_path() -> io::Result<PathBuf> {
@@ -49,7 +58,43 @@ impl Connection {
     }
 
     pub fn send_msg(&mut self, object_id: u32, opcode: u16, args: &[u8]) -> io::Result<()> {
-        crate::wire::send_msg(&mut self.writer, object_id, opcode, args)
+        crate::wire::send_msg(&mut self.write_buf, object_id, opcode, args)
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        if self.write_buf.is_empty() {
+            return Ok(());
+        }
+
+        let fd = Fd(self.socket.as_raw_fd());
+        let mut offset = 0usize;
+        let total = self.write_buf.len();
+
+        while offset < total {
+            let buf = &self.write_buf[offset..];
+            // SAFETY: write_buf is heap-allocated and lives until submit_and_wait returns.
+            // offset(u64::MAX) signals stream semantics (equivalent to write(2)) for sockets.
+            let write_e =
+                opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32).offset(u64::MAX).build();
+            unsafe { self.ring.submission().push(&write_e) }
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+            self.ring.submit_and_wait(1)?;
+
+            let cqe = self
+                .ring
+                .completion()
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no completion entry"))?;
+            let n = cqe.result();
+            if n < 0 {
+                return Err(io::Error::from_raw_os_error(-n));
+            }
+            offset += n as usize;
+        }
+
+        tracing::trace!(bytes = total, "→ flush");
+        self.write_buf.clear();
+        Ok(())
     }
 
     pub fn send_msg_with_fds(
@@ -59,63 +104,151 @@ impl Connection {
         args: &[u8],
         fds: &[RawFd],
     ) -> io::Result<()> {
-        use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags};
-        use std::io::{IoSlice, Write};
-
-        self.writer.flush()?;
+        self.flush()?;
 
         let total_size = 8 + args.len();
         let word2 = ((total_size as u32) << 16) | (opcode as u32);
-        let mut buf = Vec::with_capacity(total_size);
-        buf.extend_from_slice(&object_id.to_le_bytes());
-        buf.extend_from_slice(&word2.to_le_bytes());
-        buf.extend_from_slice(args);
+        let mut payload = Vec::with_capacity(total_size);
+        payload.extend_from_slice(&object_id.to_le_bytes());
+        payload.extend_from_slice(&word2.to_le_bytes());
+        payload.extend_from_slice(args);
 
-        let iov = [IoSlice::new(&buf)];
-        let cmsg = [ControlMessage::ScmRights(fds)];
+        // Allocate cmsg buffer for SCM_RIGHTS.
+        let cmsg_space =
+            unsafe { libc::CMSG_SPACE((fds.len() * mem::size_of::<RawFd>()) as libc::c_uint) }
+                as usize;
+        let mut cmsg_buf = vec![0u8; cmsg_space];
+
+        let iov = libc::iovec { iov_base: payload.as_ptr() as *mut libc::c_void, iov_len: payload.len() };
+
+        let mut mhdr: libc::msghdr = unsafe { mem::zeroed() };
+        mhdr.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+        mhdr.msg_iovlen = 1;
+        mhdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        mhdr.msg_controllen = cmsg_buf.len() as _;
+
+        // Populate SCM_RIGHTS control message.
+        // SAFETY: cmsg_buf is sized via CMSG_SPACE; CMSG_FIRSTHDR/CMSG_DATA follow POSIX layout.
+        unsafe {
+            let cmsg = libc::CMSG_FIRSTHDR(&mhdr);
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN((fds.len() * mem::size_of::<RawFd>()) as libc::c_uint) as _;
+            let data = libc::CMSG_DATA(cmsg) as *mut RawFd;
+            std::ptr::copy_nonoverlapping(fds.as_ptr(), data, fds.len());
+        }
+
         tracing::trace!(object_id, opcode, bytes = total_size, fds = fds.len(), "→ sendmsg");
-        sendmsg::<nix::sys::socket::UnixAddr>(
-            self.reader.as_raw_fd(),
-            &iov,
-            &cmsg,
-            MsgFlags::empty(),
-            None,
-        )
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+
+        // SAFETY: payload, iov, cmsg_buf, and mhdr all live in this stack frame.
+        // submit_and_wait(1) returns only after the kernel completes the operation.
+        let send_e =
+            opcode::SendMsg::new(Fd(self.socket.as_raw_fd()), &mhdr as *const libc::msghdr)
+                .build();
+        unsafe { self.ring.submission().push(&send_e) }
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+        self.ring.submit_and_wait(1)?;
+
+        let cqe = self
+            .ring
+            .completion()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no completion entry"))?;
+        let n = cqe.result();
+        if n < 0 {
+            return Err(io::Error::from_raw_os_error(-n));
+        }
         Ok(())
     }
 
     pub fn recv_msg(&mut self) -> io::Result<(u32, u16, Vec<u8>)> {
-        use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
-        use std::io::IoSliceMut;
+        // Phase 1: RECVMSG for 8-byte header + any ancillary fds.
+        let mut header_buf = [0u8; 8];
+        let mut cmsg_space_buf = nix::cmsg_space!([RawFd; 28]);
 
-        let mut header = [0u8; 8];
-        let mut iov = [IoSliceMut::new(&mut header)];
-        let mut cmsg_buf = nix::cmsg_space!([RawFd; 28]);
+        let iov = libc::iovec {
+            iov_base: header_buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: 8,
+        };
+        let mut mhdr: libc::msghdr = unsafe { mem::zeroed() };
+        mhdr.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
+        mhdr.msg_iovlen = 1;
+        mhdr.msg_control = cmsg_space_buf.as_mut_ptr() as *mut libc::c_void;
+        mhdr.msg_controllen = cmsg_space_buf.len() as _;
 
-        let msg = recvmsg::<nix::sys::socket::UnixAddr>(
-            self.reader.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg_buf),
-            MsgFlags::empty(),
-        )
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+        // SAFETY: header_buf, cmsg_space_buf, iov, mhdr all live in this stack frame.
+        let recv_e =
+            opcode::RecvMsg::new(Fd(self.socket.as_raw_fd()), &mut mhdr as *mut libc::msghdr)
+                .build();
+        unsafe { self.ring.submission().push(&recv_e) }
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+        self.ring.submit_and_wait(1)?;
 
-        for cmsg in msg.cmsgs().map_err(|e| io::Error::from_raw_os_error(e as i32))? {
-            if let ControlMessageOwned::ScmRights(fds) = cmsg {
-                for fd in fds {
-                    self.pending_fds.push_back(unsafe { OwnedFd::from_raw_fd(fd) });
+        let cqe = self
+            .ring
+            .completion()
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no completion entry"))?;
+        let n = cqe.result();
+        if n < 0 {
+            return Err(io::Error::from_raw_os_error(-n));
+        }
+
+        // Extract any received fds from cmsg.
+        // SAFETY: kernel updated mhdr.msg_controllen; CMSG_FIRSTHDR/NXTHDR follow POSIX layout.
+        // from_raw_fd takes ownership of each fd the kernel passed us.
+        unsafe {
+            let mut cmsg_ptr = libc::CMSG_FIRSTHDR(&mhdr);
+            while !cmsg_ptr.is_null() {
+                if (*cmsg_ptr).cmsg_level == libc::SOL_SOCKET
+                    && (*cmsg_ptr).cmsg_type == libc::SCM_RIGHTS
+                {
+                    let data_ptr = libc::CMSG_DATA(cmsg_ptr) as *const RawFd;
+                    let fd_count = ((*cmsg_ptr).cmsg_len as usize
+                        - mem::size_of::<libc::cmsghdr>())
+                        / mem::size_of::<RawFd>();
+                    for i in 0..fd_count {
+                        let fd = *data_ptr.add(i);
+                        self.pending_fds.push_back(OwnedFd::from_raw_fd(fd));
+                    }
                 }
+                cmsg_ptr = libc::CMSG_NXTHDR(&mhdr, cmsg_ptr);
             }
         }
 
-        let object_id = u32::from_le_bytes(header[0..4].try_into().unwrap());
-        let word2 = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        // Decode header fields.
+        let object_id = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+        let word2 = u32::from_le_bytes(header_buf[4..8].try_into().unwrap());
         let total_len = (word2 >> 16) as usize;
         let opcode = (word2 & 0xffff) as u16;
         let body_len = total_len - 8;
+
+        // Phase 2: READ the body bytes.
         let mut body = vec![0u8; body_len];
-        self.reader.read_exact(&mut body)?;
+        if body_len > 0 {
+            // SAFETY: body is heap-allocated; submit_and_wait(1) is synchronous.
+            let read_e = opcode::Read::new(
+                Fd(self.socket.as_raw_fd()),
+                body.as_mut_ptr(),
+                body_len as u32,
+            )
+            .offset(u64::MAX)
+            .build();
+            unsafe { self.ring.submission().push(&read_e) }
+                .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+            self.ring.submit_and_wait(1)?;
+
+            let cqe = self
+                .ring
+                .completion()
+                .next()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no completion entry"))?;
+            let n = cqe.result();
+            if n < 0 {
+                return Err(io::Error::from_raw_os_error(-n));
+            }
+        }
 
         tracing::trace!(object_id, opcode, bytes = total_len, "← recvmsg");
         Ok((object_id, opcode, body))
@@ -125,10 +258,5 @@ impl Connection {
         self.pending_fds
             .pop_front()
             .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no fd in queue"))
-    }
-
-    pub fn flush(&mut self) -> io::Result<()> {
-        use std::io::Write;
-        self.writer.flush()
     }
 }
