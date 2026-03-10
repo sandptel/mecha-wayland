@@ -26,7 +26,7 @@ impl Connection {
 
     pub fn connect_to(path: &Path) -> io::Result<Self> {
         let socket = UnixStream::connect(path)?;
-        let ring = IoUring::new(8).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let ring = IoUring::new(8).map_err(io::Error::other)?;
         Ok(Connection {
             socket,
             ring,
@@ -74,17 +74,18 @@ impl Connection {
             let buf = &self.write_buf[offset..];
             // SAFETY: write_buf is heap-allocated and lives until submit_and_wait returns.
             // offset(u64::MAX) signals stream semantics (equivalent to write(2)) for sockets.
-            let write_e =
-                opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32).offset(u64::MAX).build();
+            let write_e = opcode::Write::new(fd, buf.as_ptr(), buf.len() as u32)
+                .offset(u64::MAX)
+                .build();
             unsafe { self.ring.submission().push(&write_e) }
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+                .map_err(|_| io::Error::other("submission queue full"))?;
             self.ring.submit_and_wait(1)?;
 
             let cqe = self
                 .ring
                 .completion()
                 .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no completion entry"))?;
+                .ok_or_else(|| io::Error::other("no completion entry"))?;
             let n = cqe.result();
             if n < 0 {
                 return Err(io::Error::from_raw_os_error(-n));
@@ -115,11 +116,14 @@ impl Connection {
 
         // Allocate cmsg buffer for SCM_RIGHTS.
         let cmsg_space =
-            unsafe { libc::CMSG_SPACE((fds.len() * mem::size_of::<RawFd>()) as libc::c_uint) }
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as libc::c_uint) }
                 as usize;
         let mut cmsg_buf = vec![0u8; cmsg_space];
 
-        let iov = libc::iovec { iov_base: payload.as_ptr() as *mut libc::c_void, iov_len: payload.len() };
+        let iov = libc::iovec {
+            iov_base: payload.as_ptr() as *mut libc::c_void,
+            iov_len: payload.len(),
+        };
 
         let mut mhdr: libc::msghdr = unsafe { mem::zeroed() };
         mhdr.msg_iov = &iov as *const libc::iovec as *mut libc::iovec;
@@ -134,27 +138,32 @@ impl Connection {
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             (*cmsg).cmsg_len =
-                libc::CMSG_LEN((fds.len() * mem::size_of::<RawFd>()) as libc::c_uint) as _;
+                libc::CMSG_LEN(std::mem::size_of_val(fds) as libc::c_uint) as _;
             let data = libc::CMSG_DATA(cmsg) as *mut RawFd;
             std::ptr::copy_nonoverlapping(fds.as_ptr(), data, fds.len());
         }
 
-        tracing::trace!(object_id, opcode, bytes = total_size, fds = fds.len(), "→ sendmsg");
+        tracing::trace!(
+            object_id,
+            opcode,
+            bytes = total_size,
+            fds = fds.len(),
+            "→ sendmsg"
+        );
 
         // SAFETY: payload, iov, cmsg_buf, and mhdr all live in this stack frame.
         // submit_and_wait(1) returns only after the kernel completes the operation.
         let send_e =
-            opcode::SendMsg::new(Fd(self.socket.as_raw_fd()), &mhdr as *const libc::msghdr)
-                .build();
+            opcode::SendMsg::new(Fd(self.socket.as_raw_fd()), &mhdr as *const libc::msghdr).build();
         unsafe { self.ring.submission().push(&send_e) }
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+            .map_err(|_| std::io::Error::other("submission queue full"))?;
         self.ring.submit_and_wait(1)?;
 
         let cqe = self
             .ring
             .completion()
             .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no completion entry"))?;
+            .ok_or_else(|| std::io::Error::other("no completion entry"))?;
         let n = cqe.result();
         if n < 0 {
             return Err(io::Error::from_raw_os_error(-n));
@@ -182,14 +191,14 @@ impl Connection {
             opcode::RecvMsg::new(Fd(self.socket.as_raw_fd()), &mut mhdr as *mut libc::msghdr)
                 .build();
         unsafe { self.ring.submission().push(&recv_e) }
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+            .map_err(|_| io::Error::other("submission queue full"))?;
         self.ring.submit_and_wait(1)?;
 
         let cqe = self
             .ring
             .completion()
             .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no completion entry"))?;
+            .ok_or_else(|| io::Error::other("no completion entry"))?;
         let n = cqe.result();
         if n < 0 {
             return Err(io::Error::from_raw_os_error(-n));
@@ -236,14 +245,14 @@ impl Connection {
             .offset(u64::MAX)
             .build();
             unsafe { self.ring.submission().push(&read_e) }
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+                .map_err(|_| io::Error::other("submission queue full"))?;
             self.ring.submit_and_wait(1)?;
 
             let cqe = self
                 .ring
                 .completion()
                 .next()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no completion entry"))?;
+                .ok_or_else(|| io::Error::other("no completion entry"))?;
             let n = cqe.result();
             if n < 0 {
                 return Err(io::Error::from_raw_os_error(-n));
@@ -257,6 +266,6 @@ impl Connection {
     pub fn pop_fd(&mut self) -> io::Result<OwnedFd> {
         self.pending_fds
             .pop_front()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no fd in queue"))
+            .ok_or_else(|| io::Error::other("Error"))
     }
 }
