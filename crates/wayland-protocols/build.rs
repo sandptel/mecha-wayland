@@ -346,7 +346,7 @@ impl OffsetTracker {
 fn build_request_body(iface_name: &str, req: &Request) -> RequestBody {
     let args = req.args();
     let has_fds = args.iter().any(|a| a.arg_type == "fd");
-    let opcode_path = format!("{}::request::{}", iface_name, to_const_name(&req.name));
+    let opcode_path = format!("{}_proto::request::{}", iface_name, to_const_name(&req.name));
 
     let mut params = String::new();
     let mut encode_lines: Vec<String> = Vec::new();
@@ -502,8 +502,9 @@ fn snippet_const_module(
     } else {
         format!("    pub mod event {{\n{evt_consts}    }}\n")
     };
+    let mod_name = format!("{iface_name}_proto");
     format!(
-        "pub mod {iface_name} {{\n    pub const INTERFACE: &str = {iface_name:?};\n    pub const VERSION: u32 = {version};\n{req_block}{evt_block}}}\n\n"
+        "pub mod {mod_name} {{\n    pub const INTERFACE: &str = {iface_name:?};\n    pub const VERSION: u32 = {version};\n{req_block}{evt_block}}}\n\n"
     )
 }
 
@@ -538,7 +539,15 @@ impl crate::object::Object for {pascal} {{
     )
 }
 
-/// One request method inside a handler trait.
+/// Inherent impl block containing public request methods.
+fn snippet_inherent_impl(pascal: &str, methods: &str) -> String {
+    if methods.is_empty() {
+        return String::new();
+    }
+    format!("impl {pascal} {{\n{methods}}}\n\n")
+}
+
+/// One request method as a `pub` inherent method or a non-pub trait method.
 /// `body_stmts` already has 8-space indentation and trailing newline(s).
 fn snippet_request_method(
     method_name: &str,
@@ -548,15 +557,22 @@ fn snippet_request_method(
     req_name: &str,
     body_stmts: &str,
     send_call: &str,
+    is_pub: bool,
 ) -> String {
+    let pub_kw = if is_pub { "pub " } else { "" };
     format!(
-        r#"    fn {method_name}(&self, conn: &mut crate::connection::Connection{extra_params}) -> std::io::Result<()> {{
+        r#"    {pub_kw}fn {method_name}(&self, conn: &mut crate::connection::Connection{extra_params}) -> std::io::Result<()> {{
         tracing::debug!(object_id = self.object_id(), opcode = {log_path}, "{iface_name}.{req_name}");
 {body_stmts}        {send_call}
     }}
 
 "#
     )
+}
+
+/// Default impl of a handler trait for the generated concrete type.
+fn snippet_default_impl(trait_name: &str, pascal: &str) -> String {
+    format!("impl {trait_name} for {pascal} {{}}\n\n")
 }
 
 /// One match arm inside dispatch.
@@ -596,20 +612,13 @@ fn snippet_dispatch_empty() -> String {
     "    fn dispatch(&mut self, _conn: &mut crate::connection::Connection, opcode: u16, _body: &[u8]) -> std::io::Result<()> {\n        let _ = opcode;\n        Ok(())\n    }\n".to_string()
 }
 
-/// Complete handler trait.
-/// `methods`   — concatenated request-method snippets (each ends with `\n\n`), or `""`.
-/// `callbacks` — concatenated `fn on_*(...);` lines (each ends with `\n`), or `""`.
+/// Complete handler trait (event callbacks + provided dispatch only; no request methods).
+/// `callbacks` — concatenated `fn on_*(...) {}` defaults (each ends with `\n`), or `""`.
 /// `dispatch`  — the dispatch snippet (ends with `\n`).
-fn snippet_handler_trait(
-    trait_name: &str,
-    methods: &str,
-    callbacks: &str,
-    dispatch: &str,
-) -> String {
-    // Blank line between callbacks and dispatch only when there are events.
+fn snippet_handler_trait(trait_name: &str, callbacks: &str, dispatch: &str) -> String {
     let sep = if callbacks.is_empty() { "" } else { "\n" };
     format!(
-        "pub trait {trait_name}: crate::object::Object {{\n\n{methods}{callbacks}{sep}{dispatch}}}\n\n"
+        "pub trait {trait_name}: crate::object::Object {{\n{callbacks}{sep}{dispatch}}}\n\n"
     )
 }
 
@@ -673,15 +682,13 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
         // Concrete struct + Object impl
         write!(f, "{}", snippet_concrete_type(&iface_pascal))?;
 
-        // Handler trait
-        let trait_name = format!("{}Handler", iface_pascal);
-
-        let methods: String = requests
+        // Inherent impl — public request sender methods
+        let inherent_methods: String = requests
             .iter()
             .map(|req| {
                 let method_name = escape_keyword(&req.name.replace('-', "_"));
                 let log_path =
-                    format!("{}::request::{}", iface.name, to_const_name(&req.name));
+                    format!("{}_proto::request::{}", iface.name, to_const_name(&req.name));
                 let req_name = req.name.replace('-', "_");
                 let rb = build_request_body(&iface.name, req);
                 snippet_request_method(
@@ -692,9 +699,14 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
                     &req_name,
                     &rb.body_stmts,
                     &rb.send_call,
+                    true,
                 )
             })
             .collect();
+        write!(f, "{}", snippet_inherent_impl(&iface_pascal, &inherent_methods))?;
+
+        // Handler trait — event callbacks + provided dispatch only
+        let trait_name = format!("{}Handler", iface_pascal);
 
         let callbacks: String = events
             .iter()
@@ -702,11 +714,11 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
                 let args = evt.args();
                 let cb_name = format!("on_{}", evt.name.replace('-', "_"));
                 if args.is_empty() {
-                    format!("    fn {}(&mut self);\n", cb_name)
+                    format!("    fn {}(&mut self) {{}}\n", cb_name)
                 } else {
                     let struct_name =
                         format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
-                    format!("    fn {}(&mut self, event: {});\n", cb_name, struct_name)
+                    format!("    fn {}(&mut self, _event: {}) {{}}\n", cb_name, struct_name)
                 }
             })
             .collect();
@@ -728,7 +740,7 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
                 .map(|evt| {
                     let args = evt.args();
                     let opcode_const =
-                        format!("{}::event::{}", iface.name, to_const_name(&evt.name));
+                        format!("{}_proto::event::{}", iface.name, to_const_name(&evt.name));
                     let evt_name = evt.name.replace('-', "_");
                     let cb_name = format!("on_{}", evt_name);
 
@@ -764,11 +776,10 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
             snippet_dispatch(conn_param, body_param, &match_arms)
         };
 
-        write!(
-            f,
-            "{}",
-            snippet_handler_trait(&trait_name, &methods, &callbacks, &dispatch)
-        )?;
+        write!(f, "{}", snippet_handler_trait(&trait_name, &callbacks, &dispatch))?;
+
+        // Default impl — same crate, no orphan issue
+        write!(f, "{}", snippet_default_impl(&trait_name, &iface_pascal))?;
     }
     Ok(())
 }
@@ -797,9 +808,13 @@ fn main() -> anyhow::Result<()> {
     let mut f = open("wayland_protocol.rs")?;
     writeln!(f, "// Auto-generated. DO NOT EDIT.")?;
     writeln!(f)?;
+    // Bring Object::object_id() into scope for generated inherent impls.
+    writeln!(f, "#[allow(unused_imports)]")?;
+    writeln!(f, "use crate::object::Object as _;")?;
+    writeln!(f)?;
 
-    generate_protocol(&mut f, "wayland.xml")?;
-    generate_protocol(&mut f, "xdg-shell.xml")?;
+    generate_protocol(&mut f, "protocols/wayland.xml")?;
+    generate_protocol(&mut f, "protocols/xdg-shell.xml")?;
 
     Ok(())
 }
