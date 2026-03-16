@@ -6,7 +6,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-use io_uring::{opcode, types::Fd, IoUring};
+use io_uring::{IoUring, opcode, types::Fd};
 use tracing::{debug, info};
 
 pub struct Connection {
@@ -15,6 +15,7 @@ pub struct Connection {
     write_buf: Vec<u8>,
     next_id: u32,
     pending_fds: VecDeque<OwnedFd>,
+    recycled_ids: Vec<u32>,
 }
 
 impl Connection {
@@ -33,6 +34,7 @@ impl Connection {
             write_buf: Vec::with_capacity(4096),
             next_id: 2,
             pending_fds: VecDeque::new(),
+            recycled_ids: Vec::new(),
         })
     }
 
@@ -103,9 +105,11 @@ impl Connection {
         object_id: u32,
         opcode: u16,
         args: &[u8],
-        fds: &[RawFd],
+        fds: Vec<OwnedFd>,
     ) -> io::Result<()> {
         self.flush()?;
+
+        let raw_fds: Vec<RawFd> = fds.iter().map(|f| f.as_raw_fd()).collect();
 
         let total_size = 8 + args.len();
         let word2 = ((total_size as u32) << 16) | (opcode as u32);
@@ -116,7 +120,7 @@ impl Connection {
 
         // Allocate cmsg buffer for SCM_RIGHTS.
         let cmsg_space =
-            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as libc::c_uint) }
+            unsafe { libc::CMSG_SPACE(std::mem::size_of_val(raw_fds.as_slice()) as libc::c_uint) }
                 as usize;
         let mut cmsg_buf = vec![0u8; cmsg_space];
 
@@ -138,16 +142,16 @@ impl Connection {
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
             (*cmsg).cmsg_len =
-                libc::CMSG_LEN(std::mem::size_of_val(fds) as libc::c_uint) as _;
+                libc::CMSG_LEN(std::mem::size_of_val(raw_fds.as_slice()) as libc::c_uint) as _;
             let data = libc::CMSG_DATA(cmsg) as *mut RawFd;
-            std::ptr::copy_nonoverlapping(fds.as_ptr(), data, fds.len());
+            std::ptr::copy_nonoverlapping(raw_fds.as_ptr(), data, raw_fds.len());
         }
 
         tracing::trace!(
             object_id,
             opcode,
             bytes = total_size,
-            fds = fds.len(),
+            fds = raw_fds.len(),
             "→ sendmsg"
         );
 
@@ -261,6 +265,29 @@ impl Connection {
 
         tracing::trace!(object_id, opcode, bytes = total_len, "← recvmsg");
         Ok((object_id, opcode, body))
+    }
+
+    /// Non-blocking recv: returns `Ok(None)` immediately if no data is waiting.
+    /// Uses a MSG_DONTWAIT|MSG_PEEK check before delegating to `recv_msg`.
+    pub fn try_recv_msg(&mut self) -> io::Result<Option<(u32, u16, Vec<u8>)>> {
+        let mut byte = 0u8;
+        let n = unsafe {
+            libc::recv(
+                self.socket.as_raw_fd(),
+                &mut byte as *mut u8 as *mut libc::c_void,
+                1,
+                libc::MSG_DONTWAIT | libc::MSG_PEEK,
+            )
+        };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            return if e.kind() == io::ErrorKind::WouldBlock {
+                Ok(None)
+            } else {
+                Err(e)
+            };
+        }
+        self.recv_msg().map(Some)
     }
 
     pub fn pop_fd(&mut self) -> io::Result<OwnedFd> {

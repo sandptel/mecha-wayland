@@ -2,3 +2,11 @@
 name = "renderer"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+khronos-egl = { workspace = true }
+glow = { workspace = true }
+anyhow = { workspace = true }
+libc = { workspace = true }
+tracing = { workspace = true }
+gbm = { version = "0.18", default-features = false }

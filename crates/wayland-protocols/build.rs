@@ -244,10 +244,7 @@ impl Arg {
                  let _pad = (4 - (_arr.len() % 4)) % 4; for _ in 0.._pad {{ args.push(0); }} }}",
                 param
             ),
-            "fd" => format!(
-                "fds.push(std::os::unix::io::IntoRawFd::into_raw_fd({}));",
-                param
-            ),
+            "fd" => format!("fds.push({});", param),
             _ => format!("crate::wire::write_u32(&mut args, {});", param),
         }
     }
@@ -262,11 +259,11 @@ fn to_const_name(s: &str) -> String {
 /// Prefix Rust keywords with `r#` so they can be used as identifiers.
 fn escape_keyword(s: &str) -> String {
     match s {
-        "as" | "async" | "await" | "break" | "const" | "continue" | "crate" | "dyn"
-        | "else" | "enum" | "extern" | "false" | "fn" | "for" | "if" | "impl" | "in"
-        | "let" | "loop" | "match" | "mod" | "move" | "mut" | "pub" | "ref" | "return"
-        | "self" | "Self" | "static" | "struct" | "super" | "trait" | "true" | "type"
-        | "union" | "unsafe" | "use" | "where" | "while" => format!("r#{}", s),
+        "as" | "async" | "await" | "break" | "const" | "continue" | "crate" | "dyn" | "else"
+        | "enum" | "extern" | "false" | "fn" | "for" | "if" | "impl" | "in" | "let" | "loop"
+        | "match" | "mod" | "move" | "mut" | "pub" | "ref" | "return" | "self" | "Self"
+        | "static" | "struct" | "super" | "trait" | "true" | "type" | "union" | "unsafe"
+        | "use" | "where" | "while" => format!("r#{}", s),
         _ => s.to_string(),
     }
 }
@@ -306,7 +303,10 @@ struct OffsetTracker {
 
 impl OffsetTracker {
     fn new() -> Self {
-        OffsetTracker { fixed: 0, dynamic: None }
+        OffsetTracker {
+            fixed: 0,
+            dynamic: None,
+        }
     }
 
     fn current(&self) -> String {
@@ -346,7 +346,11 @@ impl OffsetTracker {
 fn build_request_body(iface_name: &str, req: &Request) -> RequestBody {
     let args = req.args();
     let has_fds = args.iter().any(|a| a.arg_type == "fd");
-    let opcode_path = format!("{}_proto::request::{}", iface_name, to_const_name(&req.name));
+    let opcode_path = format!(
+        "{}_proto::request::{}",
+        iface_name,
+        to_const_name(&req.name)
+    );
 
     let mut params = String::new();
     let mut encode_lines: Vec<String> = Vec::new();
@@ -381,9 +385,7 @@ fn build_request_body(iface_name: &str, req: &Request) -> RequestBody {
     } else {
         let mut s = "        let mut args = Vec::new();\n".to_string();
         if has_fds {
-            s.push_str(
-                "        let mut fds: Vec<std::os::unix::io::RawFd> = Vec::new();\n",
-            );
+            s.push_str("        let mut fds: Vec<std::os::unix::io::OwnedFd> = Vec::new();\n");
         }
         for line in &encode_lines {
             s.push_str(&format!("        {}\n", line));
@@ -393,14 +395,19 @@ fn build_request_body(iface_name: &str, req: &Request) -> RequestBody {
 
     let send_call = if has_fds {
         format!(
-            "conn.send_msg_with_fds(self.object_id(), {}, &args, &fds)",
+            "conn.send_msg_with_fds(self.object_id(), {}, &args, fds)",
             opcode_path
         )
     } else {
         format!("conn.send_msg(self.object_id(), {}, &args)", opcode_path)
     };
 
-    RequestBody { extra_params, body_stmts, send_call, has_fds }
+    RequestBody {
+        extra_params,
+        body_stmts,
+        send_call,
+        has_fds,
+    }
 }
 
 /// Decodes event args into variable-binding statements.
@@ -415,10 +422,7 @@ fn build_decode_stmts(args: &[&Arg]) -> DecodeResult {
         field_names.push(var.clone());
 
         if arg.arg_type == "fd" {
-            stmts.push_str(&format!(
-                "                let {} = conn.pop_fd()?;\n",
-                var
-            ));
+            stmts.push_str(&format!("                let {} = conn.pop_fd()?;\n", var));
             continue;
         }
 
@@ -617,9 +621,7 @@ fn snippet_dispatch_empty() -> String {
 /// `dispatch`  — the dispatch snippet (ends with `\n`).
 fn snippet_handler_trait(trait_name: &str, callbacks: &str, dispatch: &str) -> String {
     let sep = if callbacks.is_empty() { "" } else { "\n" };
-    format!(
-        "pub trait {trait_name}: crate::object::Object {{\n{callbacks}{sep}{dispatch}}}\n\n"
-    )
+    format!("pub trait {trait_name}: crate::object::Object {{\n{callbacks}{sep}{dispatch}}}\n\n")
 }
 
 // ── Protocol generator ────────────────────────────────────────────────────────
@@ -631,7 +633,11 @@ fn emit_const_modules(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow::
             .iter()
             .enumerate()
             .map(|(op, req)| {
-                format!("        pub const {}: u16 = {};\n", to_const_name(&req.name), op)
+                format!(
+                    "        pub const {}: u16 = {};\n",
+                    to_const_name(&req.name),
+                    op
+                )
             })
             .collect();
 
@@ -640,7 +646,11 @@ fn emit_const_modules(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow::
             .iter()
             .enumerate()
             .map(|(op, evt)| {
-                format!("        pub const {}: u16 = {};\n", to_const_name(&evt.name), op)
+                format!(
+                    "        pub const {}: u16 = {};\n",
+                    to_const_name(&evt.name),
+                    op
+                )
             })
             .collect();
 
@@ -668,13 +678,7 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
             let struct_name = format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
             let fields: String = args
                 .iter()
-                .map(|a| {
-                    format!(
-                        "    pub {}: {},\n",
-                        escape_keyword(&a.name),
-                        a.rust_type()
-                    )
-                })
+                .map(|a| format!("    pub {}: {},\n", escape_keyword(&a.name), a.rust_type()))
                 .collect();
             write!(f, "{}", snippet_event_struct(&struct_name, &fields))?;
         }
@@ -687,8 +691,11 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
             .iter()
             .map(|req| {
                 let method_name = escape_keyword(&req.name.replace('-', "_"));
-                let log_path =
-                    format!("{}_proto::request::{}", iface.name, to_const_name(&req.name));
+                let log_path = format!(
+                    "{}_proto::request::{}",
+                    iface.name,
+                    to_const_name(&req.name)
+                );
                 let req_name = req.name.replace('-', "_");
                 let rb = build_request_body(&iface.name, req);
                 snippet_request_method(
@@ -703,7 +710,11 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
                 )
             })
             .collect();
-        write!(f, "{}", snippet_inherent_impl(&iface_pascal, &inherent_methods))?;
+        write!(
+            f,
+            "{}",
+            snippet_inherent_impl(&iface_pascal, &inherent_methods)
+        )?;
 
         // Handler trait — event callbacks + provided dispatch only
         let trait_name = format!("{}Handler", iface_pascal);
@@ -716,9 +727,11 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
                 if args.is_empty() {
                     format!("    fn {}(&mut self) {{}}\n", cb_name)
                 } else {
-                    let struct_name =
-                        format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
-                    format!("    fn {}(&mut self, _event: {}) {{}}\n", cb_name, struct_name)
+                    let struct_name = format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
+                    format!(
+                        "    fn {}(&mut self, _event: {}) {{}}\n",
+                        cb_name, struct_name
+                    )
                 }
             })
             .collect();
@@ -754,11 +767,8 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
                     let call = if args.is_empty() {
                         format!("self.{}()", cb_name)
                     } else {
-                        let struct_name = format!(
-                            "{}{}Event",
-                            iface_pascal,
-                            to_pascal_case(&evt.name)
-                        );
+                        let struct_name =
+                            format!("{}{}Event", iface_pascal, to_pascal_case(&evt.name));
                         let fields = field_names.join(", ");
                         format!("self.{}({} {{ {} }})", cb_name, struct_name, fields)
                     };
@@ -776,7 +786,11 @@ fn emit_handler_traits(f: &mut impl Write, interfaces: &[&Interface]) -> anyhow:
             snippet_dispatch(conn_param, body_param, &match_arms)
         };
 
-        write!(f, "{}", snippet_handler_trait(&trait_name, &callbacks, &dispatch))?;
+        write!(
+            f,
+            "{}",
+            snippet_handler_trait(&trait_name, &callbacks, &dispatch)
+        )?;
 
         // Default impl — same crate, no orphan issue
         write!(f, "{}", snippet_default_impl(&trait_name, &iface_pascal))?;
@@ -815,6 +829,7 @@ fn main() -> anyhow::Result<()> {
 
     generate_protocol(&mut f, "protocols/wayland.xml")?;
     generate_protocol(&mut f, "protocols/xdg-shell.xml")?;
+    generate_protocol(&mut f, "protocols/linux-dmabuf-unstable-v1.xml")?;
 
     Ok(())
 }

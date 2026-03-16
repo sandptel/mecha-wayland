@@ -7,7 +7,9 @@ pub struct Display {
 
 impl Display {
     pub fn new(object_id: u32) -> Self {
-        Display { inner: WlDisplay::new(object_id) }
+        Display {
+            inner: WlDisplay::new(object_id),
+        }
     }
 }
 

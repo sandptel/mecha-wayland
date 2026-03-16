@@ -10,7 +10,10 @@ pub struct Registry {
 
 impl Registry {
     pub fn new(id: u32) -> Self {
-        Registry { inner: WlRegistry::new(id), globals: HashMap::new() }
+        Registry {
+            inner: WlRegistry::new(id),
+            globals: HashMap::new(),
+        }
     }
 
     /// Returns `(name, version)` for the first global matching `iface`.
@@ -36,7 +39,8 @@ impl WlRegistryHandler for Registry {
             version = event.version,
             "wl_registry::global"
         );
-        self.globals.insert(event.name, (event.interface, event.version));
+        self.globals
+            .insert(event.name, (event.interface, event.version));
     }
 
     fn on_global_remove(&mut self, event: WlRegistryGlobalRemoveEvent) {
