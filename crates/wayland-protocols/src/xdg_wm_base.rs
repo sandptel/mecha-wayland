@@ -1,5 +1,5 @@
 use crate::object::Object;
-use crate::{XdgWmBase, XdgWmBasePingEvent, XdgWmBaseHandler};
+use crate::{XdgWmBase, XdgWmBaseHandler, XdgWmBasePingEvent};
 
 pub struct WmBase {
     pub inner: XdgWmBase,
@@ -8,7 +8,10 @@ pub struct WmBase {
 
 impl WmBase {
     pub fn new(inner: XdgWmBase) -> Self {
-        WmBase { inner, pending_pong: None }
+        WmBase {
+            inner,
+            pending_pong: None,
+        }
     }
 }
 

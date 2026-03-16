@@ -5,3 +5,24 @@ members = [
     "crates/renderer",
 ]
 resolver = "2"
+
+[workspace.dependencies]
+# async / io
+io-uring = "0.7"
+nix = { version = "0.29", features = ["socket", "uio"] }
+libc = "0.2"
+
+# tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# error handling
+anyhow = "1"
+
+# codegen (build-dep only)
+quick-xml = { version = "0.39", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+
+# graphics
+khronos-egl = { version = "6", features = ["dynamic"] }
+glow = "0.16"

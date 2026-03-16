@@ -13,7 +13,12 @@ pub struct Toplevel {
 
 impl Toplevel {
     pub fn new(inner: XdgToplevel) -> Self {
-        Toplevel { inner, closed: false, width: 0, height: 0 }
+        Toplevel {
+            inner,
+            closed: false,
+            width: 0,
+            height: 0,
+        }
     }
 }
 
@@ -25,7 +30,11 @@ impl Object for Toplevel {
 
 impl XdgToplevelHandler for Toplevel {
     fn on_configure(&mut self, event: XdgToplevelConfigureEvent) {
-        tracing::debug!(width = event.width, height = event.height, "xdg_toplevel::configure");
+        tracing::debug!(
+            width = event.width,
+            height = event.height,
+            "xdg_toplevel::configure"
+        );
         if event.width != 0 {
             self.width = event.width;
         }

@@ -1,15 +1,15 @@
 #![allow(unused_variables, unused_mut, dead_code)]
 
-use wayland_protocols::wl_callback::SyncCallback;
-use wayland_protocols::connection::Connection;
-use wayland_protocols::wl_display::Display;
-use wayland_protocols::wl_registry::Registry;
-use wayland_protocols::wl_shm::{alloc_shm_file, ShmHandler};
 use std::io;
 use tracing::{debug, info};
-use wayland_protocols::xdg_wm_base::WmBase;
+use wayland_protocols::connection::Connection;
+use wayland_protocols::wl_callback::SyncCallback;
+use wayland_protocols::wl_display::Display;
+use wayland_protocols::wl_registry::Registry;
+use wayland_protocols::wl_shm::{ShmHandler, alloc_shm_file};
 use wayland_protocols::xdg_surface::XdgSurf;
 use wayland_protocols::xdg_toplevel::Toplevel;
+use wayland_protocols::xdg_wm_base::WmBase;
 
 use wayland_protocols::*;
 
@@ -41,7 +41,9 @@ fn main() -> io::Result<()> {
 
     info!("sync complete, binding globals");
 
-    let (comp_name, comp_ver) = registry.find("wl_compositor").expect("wl_compositor missing");
+    let (comp_name, comp_ver) = registry
+        .find("wl_compositor")
+        .expect("wl_compositor missing");
     let (shm_name, shm_ver) = registry.find("wl_shm").expect("wl_shm missing");
     let (xdg_name, _) = registry.find("xdg_wm_base").expect("xdg_wm_base missing");
 
@@ -49,9 +51,19 @@ fn main() -> io::Result<()> {
     let shm_inner = WlShm::new(conn.alloc_id());
     let wm_inner = XdgWmBase::new(conn.alloc_id());
 
-    registry.inner.bind(&mut conn, comp_name, "wl_compositor", comp_ver.min(4), &compositor)?;
-    registry.inner.bind(&mut conn, shm_name, "wl_shm", shm_ver.min(1), &shm_inner)?;
-    registry.inner.bind(&mut conn, xdg_name, "xdg_wm_base", 1, &wm_inner)?;
+    registry.inner.bind(
+        &mut conn,
+        comp_name,
+        "wl_compositor",
+        comp_ver.min(4),
+        &compositor,
+    )?;
+    registry
+        .inner
+        .bind(&mut conn, shm_name, "wl_shm", shm_ver.min(1), &shm_inner)?;
+    registry
+        .inner
+        .bind(&mut conn, xdg_name, "xdg_wm_base", 1, &wm_inner)?;
 
     let mut shm = ShmHandler { inner: shm_inner };
     let mut wm_base = WmBase::new(wm_inner);
@@ -69,17 +81,22 @@ fn main() -> io::Result<()> {
     let xdg_inner = XdgSurface::new(conn.alloc_id());
     let top_inner = XdgToplevel::new(conn.alloc_id());
 
-    shm.inner.create_pool(&mut conn, &pool_obj, fd, size as i32)?;
+    shm.inner
+        .create_pool(&mut conn, &pool_obj, fd, size as i32)?;
     pool_obj.create_buffer(&mut conn, &buffer, 0, WIDTH, HEIGHT, stride, 1)?;
     compositor.create_surface(&mut conn, &surface)?;
-    wm_base.inner.get_xdg_surface(&mut conn, &xdg_inner, &surface)?;
+    wm_base
+        .inner
+        .get_xdg_surface(&mut conn, &xdg_inner, &surface)?;
 
     let mut xdg_surf = XdgSurf::new(xdg_inner);
     let mut toplevel = Toplevel::new(top_inner);
 
     xdg_surf.inner.get_toplevel(&mut conn, &toplevel.inner)?;
     toplevel.inner.set_title(&mut conn, "hello wayland")?;
-    toplevel.inner.set_app_id(&mut conn, "basic-wayland-client")?;
+    toplevel
+        .inner
+        .set_app_id(&mut conn, "basic-wayland-client")?;
     surface.commit(&mut conn)?;
     conn.flush()?;
 

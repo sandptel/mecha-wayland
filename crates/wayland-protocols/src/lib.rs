@@ -7,6 +7,7 @@ pub mod wl_shm;
 pub mod xdg_surface;
 pub mod xdg_toplevel;
 pub mod xdg_wm_base;
+pub mod zwp_linux_dmabuf;
 
 pub mod connection;
 pub mod object;

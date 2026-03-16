@@ -8,7 +8,10 @@ pub struct SyncCallback {
 
 impl SyncCallback {
     pub fn new(object_id: u32) -> Self {
-        SyncCallback { inner: WlCallback::new(object_id), done: false }
+        SyncCallback {
+            inner: WlCallback::new(object_id),
+            done: false,
+        }
     }
 }
 

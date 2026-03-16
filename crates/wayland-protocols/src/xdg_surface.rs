@@ -9,7 +9,11 @@ pub struct XdgSurf {
 
 impl XdgSurf {
     pub fn new(inner: XdgSurface) -> Self {
-        XdgSurf { inner, pending_ack: None, configured: false }
+        XdgSurf {
+            inner,
+            pending_ack: None,
+            configured: false,
+        }
     }
 }
 
