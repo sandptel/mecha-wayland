@@ -1,6 +1,6 @@
 #![allow(unused_variables, unused_mut, dead_code)]
-
 use anyhow::Result;
+use launcher::{profile_function, profile_scope};
 use renderer::Renderer;
 use std::time::{Duration, Instant};
 use wayland_protocols::connection::Connection;
@@ -36,9 +36,32 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
 }
 
 fn main() -> Result<()> {
+    profile_function!();
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    #[cfg(feature = "profile")]
+    let _puffin_server = {
+        puffin::set_scopes_on(true); // Tell puffin to start recording
+        let server_addr = format!("127.0.0.1:{}", puffin_http::DEFAULT_PORT);
+
+        // Keep the server handle alive for the whole process lifetime.
+        match puffin_http::Server::new(&server_addr) {
+            Ok(server) => {
+                eprintln!(
+                    "Puffin HTTP server running on {}. Connect with: puffin_viewer --url {}",
+                    server_addr, server_addr
+                );
+                Some(server) // Keep the server alive by binding it to _puffin_server
+            }
+            Err(e) => {
+                eprintln!("Failed to start Puffin server: {}", e);
+                None
+            }
+        }
+    };
 
     let mut conn = Connection::connect()?;
 
@@ -127,6 +150,10 @@ fn main() -> Result<()> {
     let mut last_fps_report = Instant::now();
 
     loop {
+        #[cfg(feature = "profile")]
+        puffin::GlobalProfiler::lock().new_frame();
+
+        profile_scope!("event_loop");
         // Drain all pending Wayland events without blocking.
         while let Some((obj_id, opcode, body)) = conn.try_recv_msg()? {
             dispatch_to!(conn, obj_id, opcode, &body;
@@ -145,6 +172,7 @@ fn main() -> Result<()> {
         if configured {
             // One-time buffer setup: create params + wl_buffer once, then reuse.
             if wl_buf.is_none() {
+                profile_scope!("dmabuf_setup");
                 let frame = renderer.present()?;
                 let params = ZwpLinuxBufferParamsV1::new(conn.alloc_id());
                 dmabuf.inner.create_params(&mut conn, &params)?;
@@ -179,12 +207,17 @@ fn main() -> Result<()> {
             let hue = (t * 72.0) % 360.0;
             let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
-            renderer.clear_screen(r, g, b);
-            renderer.sync();
-
-            surface.attach(&mut conn, buf, 0, 0)?;
-            surface.damage(&mut conn, 0, 0, WIDTH as i32, HEIGHT as i32)?;
-            surface.commit(&mut conn)?;
+            {
+                profile_scope!("renderer");
+                renderer.clear_screen(r, g, b);
+                renderer.sync();
+            }
+            {
+                profile_scope!("surface_commit");
+                surface.attach(&mut conn, buf, 0, 0)?;
+                surface.damage(&mut conn, 0, 0, WIDTH as i32, HEIGHT as i32)?;
+                surface.commit(&mut conn)?;
+            }
 
             frame_count += 1;
 
