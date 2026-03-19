@@ -5,8 +5,11 @@ use tracing::{debug, info};
 use wayland_protocols::connection::Connection;
 use wayland_protocols::wl_callback::SyncCallback;
 use wayland_protocols::wl_display::Display;
+use wayland_protocols::wl_pointer::Pointer;
 use wayland_protocols::wl_registry::Registry;
+use wayland_protocols::wl_seat::Seat;
 use wayland_protocols::wl_shm::{ShmHandler, alloc_shm_file};
+use wayland_protocols::wl_touch::Touch;
 use wayland_protocols::xdg_surface::XdgSurf;
 use wayland_protocols::xdg_toplevel::Toplevel;
 use wayland_protocols::xdg_wm_base::WmBase;
@@ -46,6 +49,7 @@ fn main() -> io::Result<()> {
         .expect("wl_compositor missing");
     let (shm_name, shm_ver) = registry.find("wl_shm").expect("wl_shm missing");
     let (xdg_name, _) = registry.find("xdg_wm_base").expect("xdg_wm_base missing");
+    let (seat_name, seat_ver) = registry.find("wl_seat").expect("wl_seat missing");
 
     let compositor = WlCompositor::new(conn.alloc_id());
     let shm_inner = WlShm::new(conn.alloc_id());
@@ -64,6 +68,16 @@ fn main() -> io::Result<()> {
     registry
         .inner
         .bind(&mut conn, xdg_name, "xdg_wm_base", 1, &wm_inner)?;
+
+    let mut seat = Seat::new(conn.alloc_id());
+
+    registry.inner.bind(
+        &mut conn,
+        seat_name,
+        "wl_seat",
+        seat_ver.min(7),
+        &seat.inner,
+    )?;
 
     let mut shm = ShmHandler { inner: shm_inner };
     let mut wm_base = WmBase::new(wm_inner);
@@ -103,11 +117,49 @@ fn main() -> io::Result<()> {
     info!("surface created, entering event loop");
 
     let mut attached = false;
+
+    let mut pointer: Option<Pointer> = None;
+    let mut touch: Option<Touch> = None;
+
     loop {
         let (obj_id, opcode, body) = conn.recv_msg()?;
         debug!(obj_id, opcode, "event");
-        dispatch_to!(conn, obj_id, opcode, &body;
-            display, registry, shm, wm_base, xdg_surf, toplevel, surface, buffer);
+
+        // Dispatch to dynamically attached devices like pointer, keyboard, etc.
+        let handled = dispatch_optional!(conn, obj_id, opcode, &body; pointer, touch);
+
+        // If it wasn't handled by optional devices, dispatch to the global objects
+        if !handled {
+            dispatch_to!(conn, obj_id, opcode, &body;
+                display, registry, shm, wm_base, xdg_surf, toplevel, surface, buffer, seat);
+        }
+
+        if seat.has_pointer && pointer.is_none() {
+            let new_pointer = Pointer::new(conn.alloc_id());
+            seat.inner.get_pointer(&mut conn, &new_pointer.inner)?;
+            pointer = Some(new_pointer);
+
+            info!("wl_pointer connected and bound");
+        } else if !seat.has_pointer && pointer.is_some() {
+            if let Some(p) = &pointer {
+                p.inner.release(&mut conn).unwrap();
+            }
+            pointer = None;
+            info!("wl_pointer disconnected and released");
+        }
+
+        if seat.has_touch && touch.is_none() {
+            let new_touch = Touch::new(conn.alloc_id());
+            seat.inner.get_touch(&mut conn, &new_touch.inner)?;
+            touch = Some(new_touch);
+            info!("wl_touch connected and bound");
+        } else if !seat.has_touch && touch.is_some() {
+            if let Some(t) = &touch {
+                t.inner.release(&mut conn).unwrap();
+            }
+            touch = None;
+            info!("wl_touch disconnected and released");
+        }
 
         if let Some(serial) = wm_base.pending_pong.take() {
             wm_base.inner.pong(&mut conn, serial)?;
