@@ -2,8 +2,11 @@
 
 pub mod wl_callback;
 pub mod wl_display;
+pub mod wl_pointer;
 pub mod wl_registry;
+pub mod wl_seat;
 pub mod wl_shm;
+pub mod wl_touch;
 pub mod xdg_surface;
 pub mod xdg_toplevel;
 pub mod xdg_wm_base;
@@ -31,5 +34,26 @@ macro_rules! dispatch_to {
         {
             tracing::debug!(obj_id = $obj_id, opcode = $opcode, "unhandled event");
         }
+    }};
+}
+
+/// Route a received Wayland event to matching optional handlers (Option<T>) by object_id.
+/// Returns true if the event was dispatched to one of the handlers.
+///
+/// Usage: `let handled = dispatch_optional!(conn, obj_id, opcode, &body; pointer, keyboard);`
+#[macro_export]
+macro_rules! dispatch_optional {
+    ($conn:expr, $obj_id:expr, $opcode:expr, $body:expr; $($opt_handler:expr),+ $(,)?) => {{
+        use $crate::object::Object as _;
+        let mut _handled = false;
+        $(
+            if let Some(h) = &mut $opt_handler {
+                if $obj_id == h.object_id() {
+                    h.dispatch(&mut $conn, $opcode, $body)?;
+                    _handled = true;
+                }
+            }
+        )+
+        _handled
     }};
 }
