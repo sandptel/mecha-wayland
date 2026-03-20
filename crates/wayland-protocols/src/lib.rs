@@ -15,6 +15,7 @@ pub mod zwp_linux_dmabuf;
 pub mod connection;
 pub mod object;
 pub mod wire;
+pub mod wlr_layer_shell;
 
 include!(concat!(env!("OUT_DIR"), "/wayland_protocol.rs"));
 

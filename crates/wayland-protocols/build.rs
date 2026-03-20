@@ -830,6 +830,7 @@ fn main() -> anyhow::Result<()> {
     generate_protocol(&mut f, "protocols/wayland.xml")?;
     generate_protocol(&mut f, "protocols/xdg-shell.xml")?;
     generate_protocol(&mut f, "protocols/linux-dmabuf-unstable-v1.xml")?;
+    generate_protocol(&mut f, "protocols/wlr-layer-shell-unstable-v1.xml")?;
 
     Ok(())
 }
