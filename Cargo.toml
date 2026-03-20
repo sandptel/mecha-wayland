@@ -26,3 +26,8 @@ serde = { version = "1", features = ["derive"] }
 # graphics
 khronos-egl = { version = "6", features = ["dynamic"] }
 glow = "0.16"
+
+# renderer extras
+bytemuck = { version = "1", features = ["derive"] }
+etagere  = "0.2"
+fontdue  = "0.9"
