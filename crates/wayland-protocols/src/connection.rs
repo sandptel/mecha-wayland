@@ -295,4 +295,12 @@ impl Connection {
             .pop_front()
             .ok_or_else(|| io::Error::other("Error"))
     }
+
+    pub fn socket_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
+    }
+
+    pub fn try_clone_socket(&self) -> io::Result<UnixStream> {
+        self.socket.try_clone()
+    }
 }
