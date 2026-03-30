@@ -121,6 +121,12 @@ fn main() -> io::Result<()> {
     let mut pointer: Option<Pointer> = None;
     let mut touch: Option<Touch> = None;
 
+    use wayland_protocols::event_manager::{EventSystem, Logger};
+
+    EventSystem::init();
+
+    let mut logger = Logger::new();
+
     loop {
         let (obj_id, opcode, body) = conn.recv_msg()?;
         debug!(obj_id, opcode, "event");
@@ -178,6 +184,9 @@ fn main() -> io::Result<()> {
             info!("window closed");
             break;
         }
+
+        logger.poll();
+
         conn.flush()?;
     }
 

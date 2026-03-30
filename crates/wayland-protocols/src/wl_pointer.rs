@@ -1,11 +1,29 @@
+use tracing::Event;
+
+use crate::event_handler;
+use crate::event_manager::{EventHandler, EventImpl, EventSystem};
+use crate::event_queues;
 use crate::object::Object;
 use crate::{WlPointer, WlPointerHandler};
-
 pub struct Pointer {
     pub inner: WlPointer,
     pub x: f64,
     pub y: f64,
 }
+
+#[derive(Clone, Debug, Copy)]
+pub enum PointerEvent {
+    OnEnter,
+    OnClick,
+}
+
+impl EventImpl for PointerEvent {}
+
+pub fn log_pointer(e: &PointerEvent) {
+    println!("key pressed - {:?}", e);
+}
+
+
 
 impl Pointer {
     pub fn new(object_id: u32) -> Self {
@@ -27,6 +45,12 @@ impl WlPointerHandler for Pointer {
     fn on_enter(&mut self, event: crate::WlPointerEnterEvent) {
         self.x = event.surface_x as f64 / 256.0;
         self.y = event.surface_y as f64 / 256.0;
+
+        let pointer_event = PointerEvent::OnEnter;
+        EventSystem::emit(pointer_event);
+
+        println!("Pointer Event Emitted");
+
         tracing::debug!(x = self.x, y = self.y, "mouse entered window");
     }
 
