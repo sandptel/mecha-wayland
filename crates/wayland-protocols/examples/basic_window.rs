@@ -5,6 +5,7 @@ use tracing::{debug, info};
 use wayland_protocols::connection::Connection;
 use wayland_protocols::wl_callback::SyncCallback;
 use wayland_protocols::wl_display::Display;
+use wayland_protocols::wl_pointer::PointerEvent;
 use wayland_protocols::wl_pointer::Pointer;
 use wayland_protocols::wl_registry::Registry;
 use wayland_protocols::wl_seat::Seat;
@@ -13,8 +14,17 @@ use wayland_protocols::wl_touch::Touch;
 use wayland_protocols::xdg_surface::XdgSurf;
 use wayland_protocols::xdg_toplevel::Toplevel;
 use wayland_protocols::xdg_wm_base::WmBase;
+use wayland_protocols::event_manager::EventHandler;
 
 use wayland_protocols::*;
+
+struct PointerLogger;
+
+impl EventHandler<PointerEvent> for PointerLogger {
+    fn handle_event(&mut self, event: &PointerEvent) {
+        info!(?event, "event manager pointer event");
+    }
+}
 
 fn main() -> io::Result<()> {
     tracing_subscriber::fmt()
@@ -121,11 +131,11 @@ fn main() -> io::Result<()> {
     let mut pointer: Option<Pointer> = None;
     let mut touch: Option<Touch> = None;
 
-    use wayland_protocols::event_manager::{EventSystem, Logger};
+    use wayland_protocols::event_manager::EventSystem;
 
     EventSystem::init();
-
-    let mut logger = Logger::new();
+    let mut pointer_logger = PointerLogger;
+    EventSystem::register_pointer_handler(&mut pointer_logger).expect("pointer handler registration must succeed");
 
     loop {
         let (obj_id, opcode, body) = conn.recv_msg()?;
@@ -185,7 +195,7 @@ fn main() -> io::Result<()> {
             break;
         }
 
-        logger.poll();
+        EventSystem::poll_all();
 
         conn.flush()?;
     }

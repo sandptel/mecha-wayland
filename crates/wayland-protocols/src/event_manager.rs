@@ -1,4 +1,3 @@
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -11,7 +10,9 @@ pub trait EventImpl: Copy + Send + Sync + 'static {}
 /// Handler storage and cursor-based draining are added in the next stage.
 pub struct EventTopic<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize> {
     queue: SpmcQueue<E>,
-    _handler_cap: PhantomData<[usize; MAX_HANDLERS]>,
+    handlers: [Option<HandlerEntry<E>>; MAX_HANDLERS],
+    cursors: [usize; MAX_HANDLERS],
+    len: usize,
 }
 
 impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize>
@@ -20,7 +21,9 @@ impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize>
     pub fn new() -> Self {
         Self {
             queue: SpmcQueue::with_capacity_pow2(QUEUE_CAP),
-            _handler_cap: PhantomData,
+            handlers: [None; MAX_HANDLERS],
+            cursors: [0; MAX_HANDLERS],
+            len: 0,
         }
     }
 
@@ -33,6 +36,92 @@ impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize>
     pub fn queue(&self) -> &SpmcQueue<E> {
         &self.queue
     }
+
+    pub fn register<H>(&mut self, handler: &mut H) -> Result<usize, RegisterHandlerError>
+    where
+        H: EventHandler<E> + 'static,
+    {
+        if self.len >= MAX_HANDLERS {
+            return Err(RegisterHandlerError::Full);
+        }
+
+        let slot = self.len;
+        self.handlers[slot] = Some(HandlerEntry::from_handler(handler));
+        self.cursors[slot] = self.queue.current_write();
+        self.len += 1;
+        Ok(slot)
+    }
+
+    pub fn handler_count(&self) -> usize {
+        self.len
+    }
+
+    /// Drain queued events and dispatch to all registered handlers.
+    ///
+    /// Overflow policy: if a handler lags beyond queue capacity, the oldest
+    /// unseen events are dropped for that handler.
+    pub fn poll(&mut self) {
+        let write = self.queue.current_write();
+        let capacity = self.queue.capacity();
+
+        for slot in 0..self.len {
+            let Some(entry) = self.handlers[slot] else {
+                continue;
+            };
+
+            let mut cursor = self.cursors[slot];
+
+            if write.saturating_sub(cursor) > capacity {
+                cursor = write - capacity;
+            }
+
+            while cursor < write {
+                let event = unsafe { self.queue.read_unchecked(cursor) };
+                unsafe {
+                    (entry.call)(entry.ctx, event);
+                }
+                cursor += 1;
+            }
+
+            self.cursors[slot] = cursor;
+        }
+    }
+}
+
+// HandlerEntry exists to make typed handlers
+// storable in a fixed array while still calling the correct handle_event implementation later
+#[derive(Clone, Copy)]
+struct HandlerEntry<E: EventImpl> {
+    ctx: *mut (),
+    call: unsafe fn(*mut (), &E),
+}
+
+impl<E: EventImpl> HandlerEntry<E> {
+    fn from_handler<H>(handler: &mut H) -> Self
+    where
+        H: EventHandler<E> + 'static,
+    {
+        Self {
+            ctx: handler as *mut H as *mut (),
+            call: call_handler::<H, E>,
+        }
+    }
+}
+
+unsafe fn call_handler<H, E>(ctx: *mut (), event: &E)
+where
+    H: EventHandler<E>,
+    E: EventImpl,
+{
+    unsafe {
+        let handler = &mut *(ctx as *mut H);
+        handler.handle_event(event);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterHandlerError {
+    Full,
 }
 
 // Example for EventTopic
@@ -54,7 +143,6 @@ impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize>
 //         }
 //     }
 // }
-
 
 // Single-producer, multi-consumer ring queue primitive.
 // Events -> Ring Buffer ( new_event -> calculate index to store (such that if buffer ring is full overrite the oldest one) -> )
@@ -117,114 +205,94 @@ pub trait EventHandler<E: EventImpl> {
 }
 
 #[macro_export]
-macro_rules! event_handler {
-    (
-        $name:ident {
-            $(
-                $event:ty => {
-                    queue: $queue:ident,
-                    handlers: [ $($handler:path),* $(,)? ]
-                }
-            ),* $(,)?
-        }
-    ) => {
-        pub struct $name {
-            $(
-                $queue: usize,
-            )*
-        }
-
-        impl $name {
-            pub fn new() -> Self {
-                Self {
-                    $(
-                        $queue: 0,
-                    )*
-                }
-            }
-
-            #[inline(always)]
-            #[allow(static_mut_refs)]
-            pub fn poll(&mut self) {
-                unsafe {
-                    $(
-                        {
-                            let q = $queue.as_ref().unwrap();
-                            let write = q.current_write();
-                            let capacity = q.mask + 1;
-
-                            if write - self.$queue > capacity {
-                                self.$queue = write - capacity;
-                            }
-
-                            while self.$queue < write {
-                                let event = q.read_unchecked(self.$queue);
-
-                                $(
-                                    $handler(event);
-                                )*
-
-                                self.$queue += 1;
-                            }
-                        }
-                    )*
-                }
-            }
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! event_queues {
+macro_rules! define_event_system {
     (
         $(
             $event:ty => {
-                queue: $queue:ident,
-                capacity: $cap:expr
+                topic: $topic:ident,
+                queue_capacity: $queue_cap:expr,
+                max_handlers: $max_handlers:expr,
+                emit: $emit_fn:ident,
+                register: $register_fn:ident,
+                poll: $poll_fn:ident
             }
         ),* $(,)?
     ) => {
         $(
-            static mut $queue: Option<SpmcQueue<$event>> = None;
+            static mut $topic: Option<$crate::event_manager::EventTopic<$event, $queue_cap, $max_handlers>> = None;
         )*
 
         pub struct EventSystem;
 
         impl EventSystem {
+            #[allow(static_mut_refs)]
             pub fn init() {
                 unsafe {
                     $(
-                        $queue = Some(SpmcQueue::with_capacity_pow2($cap));
+                        if $topic.is_none() {
+                            $topic = Some($crate::event_manager::EventTopic::new());
+                        }
                     )*
                 }
             }
 
             $(
-                #[inline(always)]
                 #[allow(static_mut_refs)]
-                pub fn emit(event: $event) {
+                #[inline(always)]
+                pub fn $emit_fn(event: $event) {
                     unsafe {
-                        $queue.as_ref().unwrap().push(event);
+                        if let Some(topic) = $topic.as_ref() {
+                            topic.emit(event);
+                        }
+                    }
+                }
+
+                #[allow(static_mut_refs)]
+                pub fn $register_fn<H>(
+                    handler: &mut H,
+                ) -> Result<usize, $crate::event_manager::RegisterHandlerError>
+                where
+                    H: $crate::event_manager::EventHandler<$event> + 'static,
+                {
+                    unsafe {
+                        if $topic.is_none() {
+                            $topic = Some($crate::event_manager::EventTopic::new());
+                        }
+
+                        $topic
+                            .as_mut()
+                            .expect("topic must be initialized")
+                            .register(handler)
+                    }
+                }
+
+                #[allow(static_mut_refs)]
+                pub fn $poll_fn() {
+                    unsafe {
+                        if let Some(topic) = $topic.as_mut() {
+                            topic.poll();
+                        }
                     }
                 }
             )*
+
+            #[inline(always)]
+            pub fn poll_all() {
+                $(
+                    Self::$poll_fn();
+                )*
+            }
         }
     };
 }
 
-use crate::wl_pointer::{PointerEvent, log_pointer};
-event_queues! {
-    PointerEvent => {
-        queue: POINTER_QUEUE,
-        capacity: 64
-    }
-}
-
-event_handler! {
-    Logger {
-        PointerEvent => {
-            queue: POINTER_QUEUE,
-            handlers: [log_pointer]
-        }
+define_event_system! {
+    crate::wl_pointer::PointerEvent => {
+        topic: POINTER_TOPIC,
+        queue_capacity: 64,
+        max_handlers: 8,
+        emit: emit_pointer,
+        register: register_pointer_handler,
+        poll: poll_pointer
     }
 }
