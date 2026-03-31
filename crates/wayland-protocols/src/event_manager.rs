@@ -2,13 +2,59 @@ use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::wl_pointer::Pointer;
-
 #[repr(align(64))]
 struct CacheAligned<T>(T);
 
 // Currently just a marker trait to abstract Events
 pub trait EventImpl: Copy + Send + Sync + 'static {}
+
+/// Handler storage and cursor-based draining are added in the next stage.
+pub struct EventTopic<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize> {
+    queue: SpmcQueue<E>,
+    _handler_cap: PhantomData<[usize; MAX_HANDLERS]>,
+}
+
+impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize>
+    EventTopic<E, QUEUE_CAP, MAX_HANDLERS>
+{
+    pub fn new() -> Self {
+        Self {
+            queue: SpmcQueue::with_capacity_pow2(QUEUE_CAP),
+            _handler_cap: PhantomData,
+        }
+    }
+
+    #[inline(always)]
+    pub fn emit(&self, event: E) {
+        self.queue.push(event);
+    }
+
+    #[inline(always)]
+    pub fn queue(&self) -> &SpmcQueue<E> {
+        &self.queue
+    }
+}
+
+// Example for EventTopic
+// // One topic = one queue lane for PointerEvent.
+// // 64 queue slots, reserve space conceptually for up to 8 handlers later.
+// use std::sync::OnceLock;
+// static POINTER_TOPIC: OnceLock<EventTopic<PointerEvent, 64, 8>> = OnceLock::new();
+
+// pub struct EventSystem;
+
+// impl EventSystem {
+//     pub fn init() {
+//         let _ = POINTER_TOPIC.set(EventTopic::new());
+//     }
+
+//     pub fn emit_pointer(event: PointerEvent) {
+//         if let Some(topic) = POINTER_TOPIC.get() {
+//             topic.emit(event);
+//         }
+//     }
+// }
+
 
 // Single-producer, multi-consumer ring queue primitive.
 // Events -> Ring Buffer ( new_event -> calculate index to store (such that if buffer ring is full overrite the oldest one) -> )
@@ -67,7 +113,7 @@ impl<T: EventImpl> SpmcQueue<T> {
 }
 
 pub trait EventHandler<E: EventImpl> {
-    fn handle_event(&mut self, event: E) {}
+    fn handle_event(&mut self, event: &E);
 }
 
 #[macro_export]
@@ -128,26 +174,6 @@ macro_rules! event_handler {
     };
 }
 
-// static mut KEY_QUEUE: Option<SpmcQueue<KeyPressed>> = None;
-
-// pub struct EventSystem {
-// }
-
-// impl EventSystem {
-//     pub fn init() {
-//         unsafe {
-//             KEY_QUEUE = Some(SpmcQueue::with_capacity_pow2(64));
-//         }
-//     }
-
-//     #[allow(static_mut_refs)]
-//     pub fn emit(event: KeyPressed) {
-//         unsafe {
-//             KEY_QUEUE.as_ref().unwrap().push(event);
-//         }
-//     }
-// }
-
 #[macro_export]
 macro_rules! event_queues {
     (
@@ -186,23 +212,6 @@ macro_rules! event_queues {
     };
 }
 
-// mod tests {
-//     use crate::event_manager::{EventSystem, Logger, PointerEvent};
-
-//     #[test]
-//     fn test_event_manager_macro() {
-//         EventSystem::init();
-
-//         let mut logger = Logger::new();
-
-//         EventSystem::emit(PointerEvent::OnClick);
-
-//         logger.poll();
-
-//         assert!(true);
-//     }
-// }
-
 use crate::wl_pointer::{PointerEvent, log_pointer};
 event_queues! {
     PointerEvent => {
@@ -213,7 +222,7 @@ event_queues! {
 
 event_handler! {
     Logger {
-        KeyPressed => {
+        PointerEvent => {
             queue: POINTER_QUEUE,
             handlers: [log_pointer]
         }
