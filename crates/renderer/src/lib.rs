@@ -18,7 +18,7 @@ use glow::HasContext;
 use khronos_egl as egl;
 
 pub use gpu_image::{GpuImage, GpuTextureId};
-pub use primitives::{AttribDesc, MonoSprite, Quad, Rect, RenderablePrimitive};
+pub use primitives::{AttribDesc, Image, MonoSprite, Quad, Rect, RenderablePrimitive};
 pub use scene::{PrimitiveId, Scene};
 pub use surface::{DmaBufSurface, RenderableSurface};
 pub use text::TextSystem;
@@ -83,7 +83,11 @@ struct Pipeline<P: RenderablePrimitive> {
 
 impl<P: RenderablePrimitive> Pipeline<P> {
     fn new(gl: &glow::Context) -> Result<Self> {
-        let program = compile_program(gl, P::vert_src(), P::frag_src())?;
+        Self::new_with_src(gl, P::vert_src(), P::frag_src())
+    }
+
+    fn new_with_src(gl: &glow::Context, vert_src: &str, frag_src: &str) -> Result<Self> {
+        let program = compile_program(gl, vert_src, frag_src)?;
         let u_viewport = unsafe { gl.get_uniform_location(program, "u_viewport") };
         let u_atlas    = unsafe { gl.get_uniform_location(program, "u_atlas") };
 
@@ -354,6 +358,64 @@ impl Renderer {
     /// Compile shaders and set up the instanced draw pipeline for primitive type `P`.
     pub fn register<P: RenderablePrimitive>(&mut self) -> Result<()> {
         let pipeline = Pipeline::<P>::new(&self.gl)?;
+        self.pipelines.insert(TypeId::of::<P>(), Box::new(pipeline));
+        Ok(())
+    }
+
+    /// Upload an [`ImageAsset`](utils::image::ImageAsset) to a GPU texture.
+    ///
+    /// Returns a [`GpuImage`] whose [`id()`](GpuImage::id) can be passed to [`Image`].
+    /// The texture is deleted automatically when all `GpuImage` handles are dropped.
+    pub fn upload_image(&self, image: &utils::image::ImageAsset) -> Result<GpuImage> {
+        let texture = unsafe {
+            use glow::HasContext;
+            let tex = self.gl.create_texture().map_err(|e| anyhow::anyhow!("{e}"))?;
+            self.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            self.gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA as i32,
+                image.width as i32,
+                image.height as i32,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&image.pixels)),
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32,
+            );
+            self.gl.tex_parameter_i32(
+                glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32,
+            );
+            self.gl.bind_texture(glow::TEXTURE_2D, None);
+            tex
+        };
+        Ok(GpuImage::new(texture, image.width, image.height, Arc::clone(&self.deletion_queue)))
+    }
+
+    /// Like [`register`](Self::register), but uses caller-supplied GLSL source
+    /// instead of `P::vert_src()` / `P::frag_src()`.
+    ///
+    /// Use this with a [`ShaderAsset`](utils::shader::ShaderAsset) loaded via
+    /// `AssetManager` to register a primitive with runtime-loaded or file-based shaders:
+    ///
+    /// ```ignore
+    /// let s = assets.get(&shader_handle).unwrap();
+    /// renderer.register_with_shader::<MyPrim>(&s.vert_src, &s.frag_src)?;
+    /// ```
+    pub fn register_with_shader<P: RenderablePrimitive>(
+        &mut self,
+        vert_src: &str,
+        frag_src: &str,
+    ) -> Result<()> {
+        let pipeline = Pipeline::<P>::new_with_src(&self.gl, vert_src, frag_src)?;
         self.pipelines.insert(TypeId::of::<P>(), Box::new(pipeline));
         Ok(())
     }

@@ -3,6 +3,7 @@ members = [
     "crates/wayland-protocols",
     "crates/launcher",
     "crates/renderer",
+    "crates/utils",
 ]
 resolver = "2"
 
@@ -18,6 +19,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # error handling
 anyhow = "1"
+
+# image decoding
+png = "0.17"
 
 # codegen (build-dep only)
 quick-xml = { version = "0.39", features = ["serialize"] }
