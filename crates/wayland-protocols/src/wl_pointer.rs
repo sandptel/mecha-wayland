@@ -37,7 +37,7 @@ impl WlPointerHandler for Pointer {
         self.y = event.surface_y as f64 / 256.0;
 
         let pointer_event = PointerEvent::OnEnter;
-        EventSystem::emit_pointer(pointer_event);
+        EventSystem::emit(pointer_event);
 
         tracing::debug!(x = self.x, y = self.y, "mouse entered window");
     }
@@ -53,7 +53,7 @@ impl WlPointerHandler for Pointer {
     }
 
     fn on_button(&mut self, event: crate::WlPointerButtonEvent) {
-        EventSystem::emit_pointer(PointerEvent::OnClick);
+        EventSystem::emit(PointerEvent::OnClick);
         tracing::debug!(
             button = event.button,
             state = event.state,

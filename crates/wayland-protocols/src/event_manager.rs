@@ -204,6 +204,16 @@ pub trait EventHandler<E: EventImpl> {
     fn handle_event(&mut self, event: &E);
 }
 
+/// Implemented internally for each event configured in `define_event_system!`.
+pub trait EventRoute: EventImpl {
+    fn ensure_init();
+    fn emit_to_topic(event: Self);
+    fn register_to_topic<H>(handler: &mut H) -> Result<usize, RegisterHandlerError>
+    where
+        H: EventHandler<Self> + 'static;
+    fn poll_topic();
+}
+
 #[macro_export]
 macro_rules! define_event_system {
     (
@@ -211,35 +221,25 @@ macro_rules! define_event_system {
             $event:ty => {
                 topic: $topic:ident,
                 queue_capacity: $queue_cap:expr,
-                max_handlers: $max_handlers:expr,
-                emit: $emit_fn:ident,
-                register: $register_fn:ident,
-                poll: $poll_fn:ident
+                max_handlers: $max_handlers:expr
             }
         ),* $(,)?
     ) => {
         $(
             static mut $topic: Option<$crate::event_manager::EventTopic<$event, $queue_cap, $max_handlers>> = None;
-        )*
 
-        pub struct EventSystem;
-
-        impl EventSystem {
-            #[allow(static_mut_refs)]
-            pub fn init() {
-                unsafe {
-                    $(
+            impl $crate::event_manager::EventRoute for $event {
+                #[allow(static_mut_refs)]
+                fn ensure_init() {
+                    unsafe {
                         if $topic.is_none() {
                             $topic = Some($crate::event_manager::EventTopic::new());
                         }
-                    )*
+                    }
                 }
-            }
 
-            $(
                 #[allow(static_mut_refs)]
-                #[inline(always)]
-                pub fn $emit_fn(event: $event) {
+                fn emit_to_topic(event: Self) {
                     unsafe {
                         if let Some(topic) = $topic.as_ref() {
                             topic.emit(event);
@@ -248,11 +248,11 @@ macro_rules! define_event_system {
                 }
 
                 #[allow(static_mut_refs)]
-                pub fn $register_fn<H>(
+                fn register_to_topic<H>(
                     handler: &mut H,
                 ) -> Result<usize, $crate::event_manager::RegisterHandlerError>
                 where
-                    H: $crate::event_manager::EventHandler<$event> + 'static,
+                    H: $crate::event_manager::EventHandler<Self> + 'static,
                 {
                     unsafe {
                         if $topic.is_none() {
@@ -267,19 +267,49 @@ macro_rules! define_event_system {
                 }
 
                 #[allow(static_mut_refs)]
-                pub fn $poll_fn() {
+                fn poll_topic() {
                     unsafe {
                         if let Some(topic) = $topic.as_mut() {
                             topic.poll();
                         }
                     }
                 }
-            )*
+            }
+        )*
+
+        pub struct EventSystem;
+
+        impl EventSystem {
+            pub fn init() {
+                $(
+                    <$event as $crate::event_manager::EventRoute>::ensure_init();
+                )*
+            }
+
+            #[inline(always)]
+            pub fn emit<E: $crate::event_manager::EventRoute>(event: E) {
+                E::ensure_init();
+                E::emit_to_topic(event);
+            }
+
+            pub fn register<E, H>(
+                handler: &mut H,
+            ) -> Result<usize, $crate::event_manager::RegisterHandlerError>
+            where
+                E: $crate::event_manager::EventRoute,
+                H: $crate::event_manager::EventHandler<E> + 'static,
+            {
+                E::register_to_topic(handler)
+            }
+
+            pub fn poll<E: $crate::event_manager::EventRoute>() {
+                E::poll_topic();
+            }
 
             #[inline(always)]
             pub fn poll_all() {
                 $(
-                    Self::$poll_fn();
+                    <$event as $crate::event_manager::EventRoute>::poll_topic();
                 )*
             }
         }
@@ -290,9 +320,8 @@ define_event_system! {
     crate::wl_pointer::PointerEvent => {
         topic: POINTER_TOPIC,
         queue_capacity: 64,
-        max_handlers: 8,
-        emit: emit_pointer,
-        register: register_pointer_handler,
-        poll: poll_pointer
+        max_handlers: 8
     }
 }
+
+// EventSystem::emit(Event);

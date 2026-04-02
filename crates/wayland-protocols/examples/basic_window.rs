@@ -135,7 +135,7 @@ fn main() -> io::Result<()> {
 
     EventSystem::init();
     let mut pointer_logger = PointerLogger;
-    EventSystem::register_pointer_handler(&mut pointer_logger)
+    EventSystem::register::<PointerEvent, _>(&mut pointer_logger)
         .expect("pointer handler registration must succeed");
 
     loop {
@@ -196,7 +196,7 @@ fn main() -> io::Result<()> {
             break;
         }
 
-        EventSystem::poll_all();
+        EventSystem::poll::<PointerEvent>();
 
         conn.flush()?;
     }
