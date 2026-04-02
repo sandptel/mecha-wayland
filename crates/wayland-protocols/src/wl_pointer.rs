@@ -9,8 +9,30 @@ pub struct Pointer {
 
 #[derive(Clone, Debug, Copy)]
 pub enum PointerEvent {
-    OnEnter,
-    OnClick,
+    OnEnter {
+        x: f64,
+        y: f64,
+    },
+    OnLeave {
+        x: f64,
+        y: f64,
+    },
+    OnMotion {
+        x: f64,
+        y: f64,
+    },
+    OnButton {
+        x: f64,
+        y: f64,
+        button: u32,
+        state: u32,
+    },
+    OnAxis {
+        x: f64,
+        y: f64,
+        axis: u32,
+        value: i32,
+    },
 }
 
 impl EventImpl for PointerEvent {}
@@ -36,24 +58,43 @@ impl WlPointerHandler for Pointer {
         self.x = event.surface_x as f64 / 256.0;
         self.y = event.surface_y as f64 / 256.0;
 
-        let pointer_event = PointerEvent::OnEnter;
+        let pointer_event = PointerEvent::OnEnter {
+            x: self.x,
+            y: self.y,
+        };
         EventSystem::emit(pointer_event);
 
         tracing::debug!(x = self.x, y = self.y, "mouse entered window");
     }
 
-    fn on_leave(&mut self, event: crate::WlPointerLeaveEvent) {
+    fn on_leave(&mut self, _event: crate::WlPointerLeaveEvent) {
+        EventSystem::emit(PointerEvent::OnLeave {
+            x: self.x,
+            y: self.y,
+        });
         tracing::debug!("mouse left window");
     }
 
     fn on_motion(&mut self, event: crate::WlPointerMotionEvent) {
         self.x = event.surface_x as f64 / 256.0;
         self.y = event.surface_y as f64 / 256.0;
+
+        EventSystem::emit(PointerEvent::OnMotion {
+            x: self.x,
+            y: self.y,
+        });
+
         tracing::trace!(x = self.x, y = self.y, "mouse motion");
     }
 
     fn on_button(&mut self, event: crate::WlPointerButtonEvent) {
-        EventSystem::emit(PointerEvent::OnClick);
+        EventSystem::emit(PointerEvent::OnButton {
+            x: self.x,
+            y: self.y,
+            button: event.button,
+            state: event.state,
+        });
+
         tracing::debug!(
             button = event.button,
             state = event.state,
@@ -64,6 +105,13 @@ impl WlPointerHandler for Pointer {
     }
 
     fn on_axis(&mut self, event: crate::WlPointerAxisEvent) {
+        EventSystem::emit(PointerEvent::OnAxis {
+            x: self.x,
+            y: self.y,
+            axis: event.axis,
+            value: event.value,
+        });
+
         tracing::trace!(axis = event.axis, value = event.value, "mouse wheel scroll");
     }
 }
