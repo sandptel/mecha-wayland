@@ -2,17 +2,76 @@
 use anyhow::Result;
 use launcher::{profile_function, profile_scope};
 use renderer::primitives::RenderablePrimitive as _;
-use renderer::{MonoSprite, Quad, Rect, Renderer, TextSystem};
+use renderer::{MonoSprite, PrimitiveId, Quad, Rect, Renderer, TextSystem};
 use std::time::{Duration, Instant};
 use wayland_protocols::connection::Connection;
+use wayland_protocols::event_manager::{EventHandler, EventSystem};
 use wayland_protocols::wl_callback::SyncCallback;
 use wayland_protocols::wl_display::Display;
+use wayland_protocols::wl_pointer::PointerEvent;
 use wayland_protocols::wl_registry::Registry;
 use wayland_protocols::xdg_surface::XdgSurf;
 use wayland_protocols::xdg_toplevel::Toplevel;
 use wayland_protocols::xdg_wm_base::WmBase;
 use wayland_protocols::zwp_linux_dmabuf::DmaBuf;
 use wayland_protocols::*;
+
+pub struct DemoText {
+    text: String,
+    color: [f32; 4],
+}
+
+impl EventHandler<PointerEvent> for DemoText {
+    fn handle_event(&mut self, event: &PointerEvent) {
+        println!("Received Event: {:?}", event);
+        match *event {
+            PointerEvent::OnEnter { x, y } => {
+                self.text = format!("Pointer entered at ({x:.1}, {y:.1})");
+                self.color = [0.20, 1.00, 0.35, 1.0];
+            }
+            PointerEvent::OnMotion { x, y } => {
+                let hue = ((x + y) as f32).rem_euclid(360.0);
+                let (r, g, b) = hsv_to_rgb(hue, 0.85, 1.0);
+                self.text = format!("Pointer moving ({x:.1}, {y:.1})");
+                self.color = [r, g, b, 1.0];
+            }
+            PointerEvent::OnButton {
+                x,
+                y,
+                button,
+                state,
+            } => {
+                let action = if state == 1 { "pressed" } else { "released" };
+                self.text = format!("Button {button} {action} at ({x:.1}, {y:.1})");
+                self.color = [1.00, 0.35, 0.30, 1.0];
+            }
+            PointerEvent::OnLeave { x, y } => {
+                self.text = format!("Pointer left near ({x:.1}, {y:.1})");
+                self.color = [0.75, 0.75, 0.75, 1.0];
+            }
+            PointerEvent::OnAxis { x, y, axis, value } => {
+                self.text = format!("Scroll axis {axis} value {value} at ({x:.1}, {y:.1})");
+                self.color = [0.25, 0.85, 1.00, 1.0];
+            }
+        }
+    }
+}
+
+// impl DemoText {
+//     fn rendered(&self, text_sys: &TextSystem) -> Vec<PrimitiveId> {
+//         text_sys
+//             .draw_text(
+//                 &mut scene,
+//                 renderer.gl(),
+//                 "Hello, Wayland!",
+//                 font_id,
+//                 24.0,
+//                 [1.0, 1.0, 1.0, 1.0],
+//                 [60.0, 110.0],
+//             )
+//             .unwrap()
+//     }
+// }
 
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     let h = h % 360.0;
@@ -71,13 +130,14 @@ fn main() -> Result<()> {
 
     display.inner.get_registry(&mut conn, &registry.inner)?;
     display.inner.sync(&mut conn, &sync)?;
+    let mut seat = Seat::new(conn.alloc_id());
     conn.flush()?;
 
     tracing::info!("waiting for globals");
 
     loop {
         let (obj_id, opcode, body) = conn.recv_msg()?;
-        dispatch_to!(conn, obj_id, opcode, &body; display, registry, sync);
+        dispatch_to!(conn, obj_id, opcode, &body; display, registry, sync,seat);
         if sync.done {
             break;
         }
@@ -93,9 +153,21 @@ fn main() -> Result<()> {
         .find("zwp_linux_dmabuf_v1")
         .expect("zwp_linux_dmabuf_v1 missing");
 
+    let (seat_name, seat_ver) = registry.find("wl_seat").expect("wl_seat missing");
+
     let compositor = WlCompositor::new(conn.alloc_id());
     let wm_inner = XdgWmBase::new(conn.alloc_id());
     let dmabuf_inner = ZwpLinuxDmabufV1::new(conn.alloc_id());
+
+    use wayland_protocols::wl_seat::Seat;
+
+    registry.inner.bind(
+        &mut conn,
+        seat_name,
+        "wl_seat",
+        seat_ver.min(7),
+        &seat.inner,
+    )?;
 
     registry.inner.bind(
         &mut conn,
@@ -145,6 +217,9 @@ fn main() -> Result<()> {
     renderer.register::<Quad>()?;
     renderer.register::<MonoSprite>()?;
 
+    use wayland_protocols::wl_pointer::Pointer;
+    let mut pointer: Option<Pointer> = None;
+
     let mut text_sys = TextSystem::new(renderer.gl(), 1024)?;
     let font_id = text_sys.load_font(include_bytes!("../assets/Inter-Regular.ttf"))?;
 
@@ -157,6 +232,16 @@ fn main() -> Result<()> {
     let mut frame_count: u64 = 0;
     let mut last_fps_report = Instant::now();
 
+    EventSystem::init();
+
+    let mut demo_text = DemoText {
+        text: "Hello World".to_string(),
+        color: [1.0, 1.0, 1.0, 1.0],
+    };
+
+    EventSystem::register::<PointerEvent, _>(&mut demo_text)
+        .expect("pointer handler registration must succeed");
+
     loop {
         #[cfg(feature = "profile")]
         puffin::GlobalProfiler::lock().new_frame();
@@ -164,8 +249,26 @@ fn main() -> Result<()> {
         profile_scope!("event_loop");
         // Drain all pending Wayland events without blocking.
         while let Some((obj_id, opcode, body)) = conn.try_recv_msg()? {
-            dispatch_to!(conn, obj_id, opcode, &body;
-                        display, registry, dmabuf, wm_base, xdg_surf, toplevel, surface);
+            let handled = dispatch_optional!(conn, obj_id, opcode, &body; pointer);
+
+            if !handled {
+                dispatch_to!(conn, obj_id, opcode, &body;
+                            display, registry, dmabuf, wm_base, xdg_surf, toplevel, surface, seat);
+            }
+        }
+
+        if seat.has_pointer && pointer.is_none() {
+            let new_pointer = Pointer::new(conn.alloc_id());
+            seat.inner.get_pointer(&mut conn, &new_pointer.inner)?;
+            pointer = Some(new_pointer);
+
+            // info!("wl_pointer connected and bound");
+        } else if !seat.has_pointer && pointer.is_some() {
+            if let Some(p) = &pointer {
+                p.inner.release(&mut conn).unwrap();
+            }
+            pointer = None;
+            // info!("wl_pointer disconnected and released");
         }
 
         if let Some(serial) = wm_base.pending_pong.take() {
@@ -245,10 +348,10 @@ fn main() -> Result<()> {
                 text_sys.draw_text(
                     &mut scene,
                     renderer.gl(),
-                    "Hello, Wayland!",
+                    &demo_text.text,
                     font_id,
                     24.0,
-                    [1.0, 1.0, 1.0, 1.0],
+                    demo_text.color,
                     [60.0, 110.0],
                 )?;
 
@@ -280,6 +383,8 @@ fn main() -> Result<()> {
             tracing::info!("window closed");
             break;
         }
+
+        EventSystem::poll::<PointerEvent>();
 
         conn.flush()?;
     }
