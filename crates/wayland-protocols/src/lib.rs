@@ -11,6 +11,7 @@ pub mod xdg_surface;
 pub mod xdg_toplevel;
 pub mod xdg_wm_base;
 pub mod zwp_linux_dmabuf;
+pub mod spmc_queue;
 pub mod event_manager;
 pub mod connection;
 pub mod object;
