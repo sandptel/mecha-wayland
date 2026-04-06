@@ -2,7 +2,7 @@
 use anyhow::Result;
 use launcher::{profile_function, profile_scope};
 use renderer::primitives::RenderablePrimitive as _;
-use renderer::{MonoSprite, PrimitiveId, Quad, Rect, Renderer, TextSystem};
+use renderer::{MonoSprite, Quad, Rect, Renderer, TextSystem};
 use std::time::{Duration, Instant};
 use wayland_protocols::connection::Connection;
 use wayland_protocols::event_manager::{EventHandler, EventSystem};
@@ -242,152 +242,170 @@ fn main() -> Result<()> {
     EventSystem::register::<PointerEvent, _>(&mut demo_text)
         .expect("pointer handler registration must succeed");
 
-    loop {
-        #[cfg(feature = "profile")]
-        puffin::GlobalProfiler::lock().new_frame();
+    // Create calloop event loop
+    let mut event_loop: calloop::EventLoop<bool> =
+        calloop::EventLoop::try_new().expect("Failed to create event loop");
 
-        profile_scope!("event_loop");
-        // Drain all pending Wayland events without blocking.
-        while let Some((obj_id, opcode, body)) = conn.try_recv_msg()? {
-            let handled = dispatch_optional!(conn, obj_id, opcode, &body; pointer);
+    // Register all event topics with calloop (safe, no unsafe!)
+    EventSystem::register_with_calloop(&event_loop.handle())
+        .expect("Failed to register event topics with calloop");
 
-            if !handled {
-                dispatch_to!(conn, obj_id, opcode, &body;
-                            display, registry, dmabuf, wm_base, xdg_surf, toplevel, surface, seat);
-            }
-        }
+    let mut should_exit = false;
 
-        if seat.has_pointer && pointer.is_none() {
-            let new_pointer = Pointer::new(conn.alloc_id());
-            seat.inner.get_pointer(&mut conn, &new_pointer.inner)?;
-            pointer = Some(new_pointer);
+    // Run the event loop with 16ms timeout (60 FPS target)
+    event_loop
+        .run(Duration::from_millis(16), &mut should_exit, |should_exit: &mut bool| {
+            // Helper to handle errors in the closure (calloop callbacks must return ())
+            let mut run_iteration = || -> Result<()> {
+                #[cfg(feature = "profile")]
+                puffin::GlobalProfiler::lock().new_frame();
 
-            // info!("wl_pointer connected and bound");
-        } else if !seat.has_pointer && pointer.is_some() {
-            if let Some(p) = &pointer {
-                p.inner.release(&mut conn).unwrap();
-            }
-            pointer = None;
-            // info!("wl_pointer disconnected and released");
-        }
+                profile_scope!("event_loop");
 
-        if let Some(serial) = wm_base.pending_pong.take() {
-            wm_base.inner.pong(&mut conn, serial)?;
-        }
+                // Drain all pending Wayland events without blocking.
+                while let Some((obj_id, opcode, body)) = conn.try_recv_msg()? {
+                    let handled = dispatch_optional!(conn, obj_id, opcode, &body; pointer);
 
-        if let Some(serial) = xdg_surf.pending_ack.take() {
-            xdg_surf.inner.ack_configure(&mut conn, serial)?;
-            configured = true;
-        }
-
-        if configured {
-            if wl_buf.is_none() {
-                profile_scope!("dmabuf_setup");
-                let frame = renderer.present()?;
-                let params = ZwpLinuxBufferParamsV1::new(conn.alloc_id());
-                dmabuf.inner.create_params(&mut conn, &params)?;
-                let mod_hi = (frame.modifier >> 32) as u32;
-                let mod_lo = frame.modifier as u32;
-                params.add(
-                    &mut conn,
-                    frame.fd,
-                    0,
-                    frame.offset,
-                    frame.stride,
-                    mod_hi,
-                    mod_lo,
-                )?;
-                let buf = WlBuffer::new(conn.alloc_id());
-                params.create_immed(
-                    &mut conn,
-                    &buf,
-                    WIDTH as i32,
-                    HEIGHT as i32,
-                    frame.format,
-                    0,
-                )?;
-                params.destroy(&mut conn)?;
-                wl_buf = Some(buf);
-            }
-
-            let buf = wl_buf.as_ref().unwrap();
-
-            let t = start.elapsed().as_secs_f32();
-            let hue = (t * 72.0) % 360.0;
-            let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
-
-            {
-                profile_scope!("renderer");
-                scene.clear_primitives();
-                scene.background = (r * 0.15, g * 0.15, b * 0.15);
-
-                Quad {
-                    bounds: Rect {
-                        x: 50.0,
-                        y: 50.0,
-                        w: 200.0,
-                        h: 100.0,
-                    },
-                    color: [r, g, b, 1.0],
-                    clip_rect: None,
+                    if !handled {
+                        dispatch_to!(conn, obj_id, opcode, &body;
+                                    display, registry, dmabuf, wm_base, xdg_surf, toplevel, surface, seat);
+                    }
                 }
-                .add_to_scene(&mut scene);
 
-                Quad {
-                    bounds: Rect {
-                        x: 0.0,
-                        y: (HEIGHT - 80) as f32,
-                        w: WIDTH as f32,
-                        h: 80.0,
-                    },
-                    color: [1.0, 0.0, 0.0, 0.8],
-                    clip_rect: None,
+                if seat.has_pointer && pointer.is_none() {
+                    let new_pointer = Pointer::new(conn.alloc_id());
+                    seat.inner.get_pointer(&mut conn, &new_pointer.inner)?;
+                    pointer = Some(new_pointer);
+                } else if !seat.has_pointer && pointer.is_some() {
+                    if let Some(p) = &pointer {
+                        p.inner.release(&mut conn)?;
+                    }
+                    pointer = None;
                 }
-                .add_to_scene(&mut scene);
 
-                text_sys.draw_text(
-                    &mut scene,
-                    renderer.gl(),
-                    &demo_text.text,
-                    font_id,
-                    24.0,
-                    demo_text.color,
-                    [60.0, 110.0],
-                )?;
+                if let Some(serial) = wm_base.pending_pong.take() {
+                    wm_base.inner.pong(&mut conn, serial)?;
+                }
 
-                renderer.begin_frame(&render_surface, scene.background);
-                renderer.render_primitive::<Quad>(&scene, &render_surface)?;
-                renderer.render_primitive::<MonoSprite>(&scene, &render_surface)?;
-                renderer.end_frame();
+                if let Some(serial) = xdg_surf.pending_ack.take() {
+                    xdg_surf.inner.ack_configure(&mut conn, serial)?;
+                    configured = true;
+                }
+
+                if configured {
+                    if wl_buf.is_none() {
+                        profile_scope!("dmabuf_setup");
+                        let frame = renderer.present()?;
+                        let params = ZwpLinuxBufferParamsV1::new(conn.alloc_id());
+                        dmabuf.inner.create_params(&mut conn, &params)?;
+                        let mod_hi = (frame.modifier >> 32) as u32;
+                        let mod_lo = frame.modifier as u32;
+                        params.add(
+                            &mut conn,
+                            frame.fd,
+                            0,
+                            frame.offset,
+                            frame.stride,
+                            mod_hi,
+                            mod_lo,
+                        )?;
+                        let buf = WlBuffer::new(conn.alloc_id());
+                        params.create_immed(
+                            &mut conn,
+                            &buf,
+                            WIDTH as i32,
+                            HEIGHT as i32,
+                            frame.format,
+                            0,
+                        )?;
+                        params.destroy(&mut conn)?;
+                        wl_buf = Some(buf);
+                    }
+
+                    let buf = wl_buf.as_ref().unwrap();
+
+                    let t = start.elapsed().as_secs_f32();
+                    let hue = (t * 72.0) % 360.0;
+                    let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
+
+                    {
+                        profile_scope!("renderer");
+                        scene.clear_primitives();
+                        scene.background = (r * 0.15, g * 0.15, b * 0.15);
+
+                        Quad {
+                            bounds: Rect {
+                                x: 50.0,
+                                y: 50.0,
+                                w: 200.0,
+                                h: 100.0,
+                            },
+                            color: [r, g, b, 1.0],
+                            clip_rect: None,
+                        }
+                        .add_to_scene(&mut scene);
+
+                        Quad {
+                            bounds: Rect {
+                                x: 0.0,
+                                y: (HEIGHT - 80) as f32,
+                                w: WIDTH as f32,
+                                h: 80.0,
+                            },
+                            color: [1.0, 0.0, 0.0, 0.8],
+                            clip_rect: None,
+                        }
+                        .add_to_scene(&mut scene);
+
+                        text_sys.draw_text(
+                            &mut scene,
+                            renderer.gl(),
+                            &demo_text.text,
+                            font_id,
+                            24.0,
+                            demo_text.color,
+                            [60.0, 110.0],
+                        )?;
+
+                        renderer.begin_frame(&render_surface, scene.background);
+                        renderer.render_primitive::<Quad>(&scene, &render_surface)?;
+                        renderer.render_primitive::<MonoSprite>(&scene, &render_surface)?;
+                        renderer.end_frame();
+                    }
+
+                    {
+                        profile_scope!("surface_commit");
+                        surface.attach(&mut conn, buf, 0, 0)?;
+                        surface.damage(&mut conn, 0, 0, WIDTH as i32, HEIGHT as i32)?;
+                        surface.commit(&mut conn)?;
+                    }
+
+                    frame_count += 1;
+                    let now = Instant::now();
+                    let since_last = now.duration_since(last_fps_report);
+                    if since_last >= Duration::from_secs(60) {
+                        let fps = frame_count as f64 / since_last.as_secs_f64();
+                        tracing::info!(fps = format!("{:.1}", fps), "FPS report");
+                        frame_count = 0;
+                        last_fps_report = now;
+                    }
+                }
+
+                if toplevel.closed {
+                    tracing::info!("window closed");
+                    *should_exit = true;
+                }
+
+                conn.flush()?;
+                Ok(())
+            };
+
+            if let Err(e) = run_iteration() {
+                tracing::error!("Event loop error: {:?}", e);
+                *should_exit = true;
             }
-
-            {
-                profile_scope!("surface_commit");
-                surface.attach(&mut conn, buf, 0, 0)?;
-                surface.damage(&mut conn, 0, 0, WIDTH as i32, HEIGHT as i32)?;
-                surface.commit(&mut conn)?;
-            }
-
-            frame_count += 1;
-            let now = Instant::now();
-            let since_last = now.duration_since(last_fps_report);
-            if since_last >= Duration::from_secs(60) {
-                let fps = frame_count as f64 / since_last.as_secs_f64();
-                tracing::info!(fps = format!("{:.1}", fps), "FPS report");
-                frame_count = 0;
-                last_fps_report = now;
-            }
-        }
-
-        if toplevel.closed {
-            tracing::info!("window closed");
-            break;
-        }
-
-        EventSystem::poll::<PointerEvent>();
-
-        conn.flush()?;
-    }
+        })
+        .expect("Event loop error");
 
     if let Some(buf) = wl_buf {
         buf.destroy(&mut conn)?;

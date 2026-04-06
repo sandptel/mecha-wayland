@@ -1,5 +1,6 @@
 pub use crate::spmc_queue::EventImpl;
 use crate::spmc_queue::SpmcQueue;
+use std::os::fd::{AsRawFd, RawFd};
 
 /// Handler storage and cursor-based draining are added in the next stage.
 pub struct EventTopic<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize> {
@@ -7,23 +8,37 @@ pub struct EventTopic<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: 
     handlers: [Option<HandlerEntry<E>>; MAX_HANDLERS],
     cursors: [usize; MAX_HANDLERS],
     len: usize,
+    wakeup_fd: RawFd,
+    token: Option<calloop::Token>,
 }
 
 impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize>
     EventTopic<E, QUEUE_CAP, MAX_HANDLERS>
 {
     pub fn new() -> Self {
+        // Create eventfd for calloop integration
+        let wakeup_fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        assert!(wakeup_fd >= 0, "Failed to create eventfd");
+
         Self {
             queue: SpmcQueue::with_capacity_pow2(QUEUE_CAP),
             handlers: [None; MAX_HANDLERS],
             cursors: [0; MAX_HANDLERS],
             len: 0,
+            wakeup_fd,
+            token: None,
         }
     }
 
     #[inline(always)]
     pub fn emit(&self, event: E) {
         self.queue.push(event);
+
+        // Signal calloop that events are available
+        let val: u64 = 1;
+        unsafe {
+            libc::write(self.wakeup_fd, &val as *const u64 as *const libc::c_void, 8);
+        }
     }
 
     #[inline(always)]
@@ -80,6 +95,99 @@ impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize>
             self.cursors[slot] = cursor;
         }
     }
+
+    /// Clear the eventfd counter (used by calloop integration)
+    fn clear_wakeup(&self) {
+        let mut buf: u64 = 0;
+        unsafe {
+            libc::read(self.wakeup_fd, &mut buf as *mut u64 as *mut libc::c_void, 8);
+        }
+    }
+}
+
+impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize> Drop
+    for EventTopic<E, QUEUE_CAP, MAX_HANDLERS>
+{
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.wakeup_fd);
+        }
+    }
+}
+
+impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize> AsRawFd
+    for EventTopic<E, QUEUE_CAP, MAX_HANDLERS>
+{
+    fn as_raw_fd(&self) -> RawFd {
+        self.wakeup_fd
+    }
+}
+
+impl<E: EventImpl, const QUEUE_CAP: usize, const MAX_HANDLERS: usize> calloop::EventSource
+    for EventTopic<E, QUEUE_CAP, MAX_HANDLERS>
+{
+    type Event = ();
+    type Metadata = ();
+    type Ret = ();
+    type Error = std::io::Error;
+
+    fn process_events<F>(
+        &mut self,
+        _readiness: calloop::Readiness,
+        _token: calloop::Token,
+        mut _callback: F,
+    ) -> Result<calloop::PostAction, Self::Error>
+    where
+        F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
+    {
+        // Clear the eventfd counter
+        self.clear_wakeup();
+
+        // Drain all queued events and dispatch to registered handlers
+        self.poll();
+
+        Ok(calloop::PostAction::Continue)
+    }
+
+    fn register(
+        &mut self,
+        poll: &mut calloop::Poll,
+        token_factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        use std::os::fd::BorrowedFd;
+
+        let token = token_factory.token();
+        unsafe {
+            let fd = BorrowedFd::borrow_raw(self.wakeup_fd);
+            poll.register(fd, calloop::Interest::READ, calloop::Mode::Edge, token)?;
+        }
+
+        self.token = Some(token);
+        Ok(())
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &mut calloop::Poll,
+        _token_factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        use std::os::fd::BorrowedFd;
+
+        let token = self.token.expect("Token must be set before reregister");
+        unsafe {
+            let fd = BorrowedFd::borrow_raw(self.wakeup_fd);
+            poll.reregister(fd, calloop::Interest::READ, calloop::Mode::Edge, token)
+        }
+    }
+
+    fn unregister(&mut self, poll: &mut calloop::Poll) -> calloop::Result<()> {
+        use std::os::fd::BorrowedFd;
+
+        unsafe {
+            let fd = BorrowedFd::borrow_raw(self.wakeup_fd);
+            poll.unregister(fd)
+        }
+    }
 }
 
 // HandlerEntry exists to make typed handlers
@@ -118,6 +226,23 @@ pub enum RegisterHandlerError {
     Full,
 }
 
+#[derive(Debug)]
+pub enum CalloopRegisterError {
+    InsertSource(String),
+    TopicNotInitialized,
+}
+
+impl std::fmt::Display for CalloopRegisterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CalloopRegisterError::InsertSource(e) => write!(f, "Failed to insert event source: {}", e),
+            CalloopRegisterError::TopicNotInitialized => write!(f, "Event topic not initialized. Call EventSystem::init() first."),
+        }
+    }
+}
+
+impl std::error::Error for CalloopRegisterError {}
+
 pub trait EventHandler<E: EventImpl> {
     fn handle_event(&mut self, event: &E);
 }
@@ -144,7 +269,7 @@ macro_rules! define_event_system {
         ),* $(,)?
     ) => {
         $(
-            static mut $topic: Option<$crate::event_manager::EventTopic<$event, $queue_cap, $max_handlers>> = None;
+            pub static mut $topic: Option<$crate::event_manager::EventTopic<$event, $queue_cap, $max_handlers>> = None;
 
             impl $crate::event_manager::EventRoute for $event {
                 #[allow(static_mut_refs)]
@@ -229,6 +354,51 @@ macro_rules! define_event_system {
                 $(
                     <$event as $crate::event_manager::EventRoute>::poll_topic();
                 )*
+            }
+
+            /// Register all event topics with a calloop event loop.
+            /// 
+            /// This method registers all event sources defined in `define_event_system!`
+            /// with the provided calloop event loop handle. When events are emitted via
+            /// `EventSystem::emit()`, they will automatically wake the event loop and
+            /// dispatch to registered handlers.
+            /// 
+            /// # Safety
+            /// Must be called after `EventSystem::init()` and before the event loop runs.
+            /// Topics must not be registered with multiple event loops.
+            /// 
+            /// # Example
+            /// ```ignore
+            /// EventSystem::init();
+            /// EventSystem::register::<PointerEvent, _>(&mut my_handler)?;
+            /// 
+            /// let mut event_loop = calloop::EventLoop::try_new()?;
+            /// EventSystem::register_with_calloop(&event_loop.handle())?;
+            /// 
+            /// event_loop.run(...)?;
+            /// ```
+            pub fn register_with_calloop<T>(
+                handle: &calloop::LoopHandle<T>,
+            ) -> Result<(), $crate::event_manager::CalloopRegisterError> {
+                unsafe {
+                    use std::ptr::addr_of_mut;
+                    
+                    $(
+                        let topic_ptr = addr_of_mut!($topic);
+                        if let Some(topic) = (*topic_ptr).as_mut() {
+                            handle
+                                .insert_source(topic, |_event, _metadata, _shared_data| {
+                                    // Event processing happens automatically in EventTopic::process_events
+                                })
+                                .map_err(|e| $crate::event_manager::CalloopRegisterError::InsertSource(
+                                    format!("Failed to register {} topic: {:?}", stringify!($topic), e)
+                                ))?;
+                        } else {
+                            return Err($crate::event_manager::CalloopRegisterError::TopicNotInitialized);
+                        }
+                    )*
+                }
+                Ok(())
             }
         }
     };
