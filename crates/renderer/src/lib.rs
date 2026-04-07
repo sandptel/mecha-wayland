@@ -17,7 +17,7 @@ use gbm::{AsRaw, BufferObjectFlags, Device as GbmDevice, Format as GbmFormat};
 use glow::HasContext;
 use khronos_egl as egl;
 
-pub use gpu_image::{GpuImage, GpuTextureId};
+pub use gpu_image::{GpuImage, GpuImageProcessor, GpuTextureId};
 pub use primitives::{AttribDesc, Image, MonoSprite, Quad, Rect, RenderablePrimitive};
 pub use scene::{PrimitiveId, Scene};
 pub use surface::{DmaBufSurface, RenderableSurface};
@@ -367,37 +367,23 @@ impl Renderer {
     /// Returns a [`GpuImage`] whose [`id()`](GpuImage::id) can be passed to [`Image`].
     /// The texture is deleted automatically when all `GpuImage` handles are dropped.
     pub fn upload_image(&self, image: &utils::image::ImageAsset) -> Result<GpuImage> {
-        let texture = unsafe {
-            use glow::HasContext;
-            let tex = self.gl.create_texture().map_err(|e| anyhow::anyhow!("{e}"))?;
-            self.gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-            self.gl.tex_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                glow::RGBA as i32,
-                image.width as i32,
-                image.height as i32,
-                0,
-                glow::RGBA,
-                glow::UNSIGNED_BYTE,
-                glow::PixelUnpackData::Slice(Some(&image.pixels)),
-            );
-            self.gl.tex_parameter_i32(
-                glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32,
-            );
-            self.gl.tex_parameter_i32(
-                glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32,
-            );
-            self.gl.tex_parameter_i32(
-                glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32,
-            );
-            self.gl.tex_parameter_i32(
-                glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32,
-            );
-            self.gl.bind_texture(glow::TEXTURE_2D, None);
-            tex
-        };
-        Ok(GpuImage::new(texture, image.width, image.height, Arc::clone(&self.deletion_queue)))
+        upload_image_to_gpu(&self.gl, image, Arc::clone(&self.deletion_queue))
+    }
+
+    /// Return a [`GpuImageProcessor`] tied to this renderer's GL context.
+    ///
+    /// Pass the processor to [`AssetManager::process_pending`] to automatically
+    /// upload all pending [`ImageAsset`](utils::image::ImageAsset)s to the GPU:
+    ///
+    /// ```ignore
+    /// asset_manager.process_pending(&mut renderer.image_processor());
+    /// let gpu_image = asset_manager.get_processed::<ImageAsset, GpuImage>(&handle).unwrap();
+    /// ```
+    pub fn image_processor(&self) -> GpuImageProcessor<'_> {
+        GpuImageProcessor {
+            gl: &self.gl,
+            deletion_queue: Arc::clone(&self.deletion_queue),
+        }
     }
 
     /// Like [`register`](Self::register), but uses caller-supplied GLSL source
@@ -506,6 +492,35 @@ impl Drop for Renderer {
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
+
+pub(crate) fn upload_image_to_gpu(
+    gl: &glow::Context,
+    image: &utils::image::ImageAsset,
+    deletion_queue: Arc<Mutex<Vec<GpuTextureId>>>,
+) -> Result<GpuImage> {
+    let texture = unsafe {
+        let tex = gl.create_texture().map_err(|e| anyhow::anyhow!("{e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            glow::RGBA as i32,
+            image.width as i32,
+            image.height as i32,
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            glow::PixelUnpackData::Slice(Some(&image.pixels)),
+        );
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        tex
+    };
+    Ok(GpuImage::new(texture, image.width, image.height, deletion_queue))
+}
 
 fn compile_program(
     gl:       &glow::Context,

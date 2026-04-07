@@ -11,14 +11,14 @@
 //!
 //! ```text
 //! AssetManager
-//! ├── AssetStore<ImageRaw>   ── HashMap<AssetId, ImageRaw>
-//! ├── AssetStore<FontRaw>    ── HashMap<AssetId, FontRaw>
-//! └── AssetStore<SvgData>    ── HashMap<AssetId, SvgData>
+//! ├── stores:    TypeId → Box<dyn Any>              (AssetStore<A> per asset type)
+//! └── processed: TypeId → Box<dyn ErasedProcessedMap>  (HashMap<AssetId, O> per output type)
 //! ```
 //!
-//! Internally, stores are type-erased behind `dyn Any` at the container level,
-//! but individual assets are never type-erased — all access is fully typed
-//! through the [`Handle<A>`] returned at load time.
+//! Both maps are keyed by `TypeId` and store their values as type-erased boxes,
+//! with a single downcast at the access site. Individual assets are never
+//! type-erased — all access is fully typed through the [`Handle<A>`] returned
+//! at load time.
 
 use anyhow::Result;
 use std::any::{Any, TypeId};
@@ -76,6 +76,18 @@ impl<A: Asset> Handle<A> {
     pub fn id(&self) -> AssetId {
         self.asset_id
     }
+
+    /// Get the post-processed output for this handle.
+    ///
+    /// Equivalent to [`AssetManager::get_processed`] but infers the asset type
+    /// from `self`, so only the output type `O` needs to be specified:
+    ///
+    /// ```ignore
+    /// let gpu_image = logo_handle.get_processed::<GpuImage>(&assets).unwrap();
+    /// ```
+    pub fn get_processed<'m, O: 'static>(&self, manager: &'m AssetManager) -> Option<&'m O> {
+        manager.get_processed::<A, O>(self)
+    }
 }
 
 /// A self-loading asset.
@@ -104,29 +116,65 @@ pub trait Asset: Sized + 'static {
     fn load(params: Self::Params) -> Result<Self>;
 }
 
+/// A post-processing step that converts a CPU-side asset into another form.
+///
+/// Implement this in crates that have access to the necessary context (e.g.
+/// a GPU context) without creating a circular dependency on `utils`.
+///
+/// # Example
+///
+/// ```ignore
+/// // In the renderer crate:
+/// impl AssetPostProcessor for GpuImageProcessor<'_> {
+///     type Input = ImageAsset;
+///     type Output = GpuImage;
+///     fn process(&mut self, asset: &ImageAsset) -> Result<GpuImage> { ... }
+/// }
+///
+/// // At init time:
+/// asset_manager.process_pending(&mut renderer.image_processor())?;
+/// let gpu_image = logo_handle.get_processed::<GpuImage>(&asset_manager).unwrap();
+/// ```
+pub trait AssetPostProcessor {
+    /// The CPU-side asset type this processor consumes.
+    type Input: Asset;
+    /// The output type produced by this processor (e.g. `GpuImage`).
+    type Output: 'static;
+    fn process(&mut self, asset: &Self::Input) -> Result<Self::Output>;
+}
+
+// ── Internal: type-erased processed map ────────────────────────────────────
+
+/// Type-erased interface for `HashMap<AssetId, O>` stored in `processed`.
+///
+/// Allows [`AssetManager::remove`] to iterate all output maps and clean up
+/// by id without knowing the concrete output type `O`.
+trait ErasedProcessedMap: Any {
+    fn remove_id(&mut self, id: AssetId);
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+impl<O: 'static> ErasedProcessedMap for HashMap<AssetId, O> {
+    fn remove_id(&mut self, id: AssetId) {
+        self.remove(&id);
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
+
 // ── Internal: per-type storage ──────────────────────────────────────────────
 
 /// Typed storage for a single asset type.
 struct AssetStore<A: Asset> {
     storage: HashMap<AssetId, A>,
-}
-
-/// Type-erased trait so we can hold heterogeneous stores in a single map.
-///
-/// `Any` is used *only* at this container level to look up the right
-/// `AssetStore<A>`. Individual assets are never type-erased.
-trait ErasedStore: Any {
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-}
-
-impl<A: Asset> ErasedStore for AssetStore<A> {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
+    pending: Vec<AssetId>,
 }
 
 // ── Asset Manager ───────────────────────────────────────────────────────────
@@ -140,7 +188,10 @@ impl<A: Asset> ErasedStore for AssetStore<A> {
 /// All public methods are fully typed through the [`Asset`] trait bound —
 /// there is no runtime type confusion possible at the call site.
 pub struct AssetManager {
-    stores: HashMap<TypeId, Box<dyn ErasedStore>>,
+    /// One `AssetStore<A>` per asset type, type-erased to `Box<dyn Any>`.
+    stores: HashMap<TypeId, Box<dyn Any>>,
+    /// Post-processed outputs: `TypeId::of::<O>()` → `HashMap<AssetId, O>`.
+    processed: HashMap<TypeId, Box<dyn ErasedProcessedMap>>,
     next_id: usize,
 }
 
@@ -149,6 +200,7 @@ impl AssetManager {
     pub fn new() -> Self {
         Self {
             stores: HashMap::new(),
+            processed: HashMap::new(),
             next_id: 0,
         }
     }
@@ -167,9 +219,9 @@ impl AssetManager {
             .or_insert_with(|| {
                 Box::new(AssetStore::<A> {
                     storage: HashMap::new(),
-                })
+                    pending: Vec::new(),
+                }) as Box<dyn Any>
             })
-            .as_any_mut()
             .downcast_mut::<AssetStore<A>>()
             .expect("AssetStore type mismatch — this is a bug")
     }
@@ -178,8 +230,10 @@ impl AssetManager {
     fn store<A: Asset>(&self) -> Option<&AssetStore<A>> {
         self.stores
             .get(&TypeId::of::<A>())
-            .and_then(|s| s.as_any().downcast_ref::<AssetStore<A>>())
+            .and_then(|s| s.downcast_ref::<AssetStore<A>>())
     }
+
+    // ── Core CRUD ────────────────────────────────────────────────────────────
 
     /// Load an asset from the given parameters.
     ///
@@ -198,7 +252,9 @@ impl AssetManager {
     {
         let asset = A::load(params.into())?;
         let id = self.next_id();
-        self.store_mut::<A>().storage.insert(id, asset);
+        let store = self.store_mut::<A>();
+        store.storage.insert(id, asset);
+        store.pending.push(id);
         Ok(Handle::new(id))
     }
 
@@ -208,7 +264,9 @@ impl AssetManager {
     /// such as procedurally generated data or assets received over the network.
     pub fn insert<A: Asset>(&mut self, asset: A) -> Handle<A> {
         let id = self.next_id();
-        self.store_mut::<A>().storage.insert(id, asset);
+        let store = self.store_mut::<A>();
+        store.storage.insert(id, asset);
+        store.pending.push(id);
         Handle::new(id)
     }
 
@@ -225,14 +283,143 @@ impl AssetManager {
         self.store_mut::<A>().storage.get_mut(&handle.id())
     }
 
-    /// Remove an asset from the manager, returning it if it existed.
+    /// Remove an asset and all its post-processed outputs from the manager.
+    ///
+    /// Iterates every output map in `processed` and removes the corresponding
+    /// entry, so no outputs are orphaned regardless of how many processors
+    /// have run on this asset.
     pub fn remove<A: Asset>(&mut self, handle: &Handle<A>) -> Option<A> {
-        self.store_mut::<A>().storage.remove(&handle.id())
+        let id = handle.id();
+        for map in self.processed.values_mut() {
+            map.remove_id(id);
+        }
+        self.store_mut::<A>().storage.remove(&id)
     }
 
     /// Returns the number of loaded assets of type `A`.
     pub fn count<A: Asset>(&self) -> usize {
         self.store::<A>().map_or(0, |s| s.storage.len())
+    }
+
+    /// Returns the number of assets of type `A` awaiting post-processing.
+    pub fn pending_count<A: Asset>(&self) -> usize {
+        self.store::<A>().map_or(0, |s| s.pending.len())
+    }
+
+    /// Iterate over handles to all loaded assets of type `A`.
+    pub fn iter_handles<A: Asset>(&self) -> impl Iterator<Item = Handle<A>> + '_ {
+        self.store::<A>()
+            .into_iter()
+            .flat_map(|s| s.storage.keys().copied().map(Handle::new))
+    }
+
+    // ── Post-processing ──────────────────────────────────────────────────────
+
+    fn processed_map_mut<O: 'static>(&mut self) -> &mut HashMap<AssetId, O> {
+        self.processed
+            .entry(TypeId::of::<O>())
+            .or_insert_with(|| {
+                Box::new(HashMap::<AssetId, O>::new()) as Box<dyn ErasedProcessedMap>
+            })
+            .as_any_mut()
+            .downcast_mut::<HashMap<AssetId, O>>()
+            .expect("processed map type mismatch — this is a bug")
+    }
+
+    fn processed_map<O: 'static>(&self) -> Option<&HashMap<AssetId, O>> {
+        self.processed
+            .get(&TypeId::of::<O>())?
+            .as_any()
+            .downcast_ref()
+    }
+
+    /// Run `processor` over every asset that has not yet been processed.
+    ///
+    /// Returns one `Result<()>` per pending asset. Failures are collected
+    /// rather than short-circuiting, so a single bad asset does not prevent
+    /// the rest from being processed. Calling this with no new loads returns
+    /// an empty `Vec`.
+    ///
+    /// Processed outputs are stored internally and can be retrieved via
+    /// [`get_processed`](Self::get_processed) or [`Handle::get_processed`].
+    pub fn process_pending<Proc>(&mut self, processor: &mut Proc) -> Vec<Result<()>>
+    where
+        Proc: AssetPostProcessor,
+    {
+        // Drain the pending list before the loop to avoid holding a mutable
+        // borrow on `stores` while we also write to `processed`.
+        let pending: Vec<AssetId> = {
+            let store = self.store_mut::<Proc::Input>();
+            store.pending.drain(..).collect()
+        };
+
+        // Phase 1: shared borrow of `stores` — read assets, run processor.
+        // Outputs are owned values so the borrow ends before phase 2.
+        let results: Vec<(AssetId, Result<Proc::Output>)> = pending
+            .into_iter()
+            .filter_map(|id| {
+                self.store::<Proc::Input>()
+                    .and_then(|s| s.storage.get(&id))
+                    .map(|asset| (id, processor.process(asset)))
+            })
+            .collect();
+
+        // Phase 2: mutable borrow of `processed` — insert successful outputs.
+        results
+            .into_iter()
+            .map(|(id, result)| {
+                result.map(|output| {
+                    self.processed_map_mut::<Proc::Output>().insert(id, output);
+                })
+            })
+            .collect()
+    }
+
+    /// Load an asset and immediately post-process it in one call.
+    ///
+    /// Unlike [`load`](Self::load) followed by [`process_pending`](Self::process_pending),
+    /// this method bypasses the pending queue entirely. The asset is loaded,
+    /// processed, and both the CPU and output forms are stored before this
+    /// call returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either [`Asset::load`] or [`AssetPostProcessor::process`] fails.
+    pub fn load_and_process<P, Proc>(
+        &mut self,
+        params: P,
+        processor: &mut Proc,
+    ) -> Result<Handle<Proc::Input>>
+    where
+        Proc: AssetPostProcessor,
+        P: Into<<Proc::Input as Asset>::Params>,
+    {
+        let asset = Proc::Input::load(params.into())?;
+        let id = self.next_id();
+        let output = processor.process(&asset)?;
+        // Not pushed to `pending` — already processed.
+        self.store_mut::<Proc::Input>().storage.insert(id, asset);
+        self.processed_map_mut::<Proc::Output>().insert(id, output);
+        Ok(Handle::new(id))
+    }
+
+    /// Get the post-processed output `O` for the given handle.
+    ///
+    /// Returns `None` if [`process_pending`](Self::process_pending) has not yet
+    /// been called for this asset, or if the asset was not found.
+    ///
+    /// If you already have a `Handle<A>`, prefer [`Handle::get_processed`] —
+    /// it infers the asset type and only requires specifying `O`.
+    pub fn get_processed<A: Asset, O: 'static>(&self, handle: &Handle<A>) -> Option<&O> {
+        self.processed_map::<O>()?.get(&handle.asset_id)
+    }
+
+    /// Get a mutable reference to a post-processed output.
+    pub fn get_processed_mut<A: Asset, O: 'static>(
+        &mut self,
+        handle: &Handle<A>,
+    ) -> Option<&mut O> {
+        self.processed_map_mut::<O>().get_mut(&handle.asset_id)
     }
 }
 

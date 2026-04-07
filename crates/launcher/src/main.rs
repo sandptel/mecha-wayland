@@ -2,7 +2,7 @@
 use anyhow::Result;
 use launcher::{profile_function, profile_scope};
 use renderer::primitives::RenderablePrimitive as _;
-use renderer::{Image, MonoSprite, Quad, Rect, Renderer, TextSystem};
+use renderer::{GpuImage, Image, MonoSprite, Quad, Rect, Renderer, TextSystem};
 use utils::asset_manager::AssetManager;
 use utils::font::FontAsset;
 use utils::image::ImageAsset;
@@ -156,7 +156,11 @@ fn main() -> Result<()> {
     let mut text_sys = TextSystem::new(renderer.gl(), 1024)?;
     let font_id = text_sys.load_font(&assets.get(&font_handle).unwrap().data)?;
 
-    let logo = renderer.upload_image(assets.get(&logo_handle).unwrap())?;
+    assets
+        .process_pending(&mut renderer.image_processor())
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let logo = logo_handle.get_processed::<GpuImage>(&assets).unwrap();
     let logo_w = logo.width as f32;
     let logo_h = logo.height as f32;
     let logo_tex = logo.id();
