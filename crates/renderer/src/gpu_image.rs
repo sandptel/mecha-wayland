@@ -1,5 +1,9 @@
 use std::sync::{Arc, Mutex};
 
+use anyhow::Result;
+use utils::asset_manager::AssetPostProcessor;
+use utils::image::ImageAsset;
+
 /// Opaque GPU texture handle. Copy because it's just a NonZeroU32.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GpuTextureId(pub glow::Texture);
@@ -33,5 +37,24 @@ impl GpuImage {
 
     pub fn id(&self) -> GpuTextureId {
         GpuTextureId(self.texture)
+    }
+}
+
+// ── AssetPostProcessor impl ─────────────────────────────────────────────────
+
+/// Uploads pending [`ImageAsset`]s to the GPU via [`AssetManager::process_pending`].
+///
+/// Obtain one from [`Renderer::image_processor`](crate::Renderer::image_processor).
+pub struct GpuImageProcessor<'a> {
+    pub(crate) gl:             &'a glow::Context,
+    pub(crate) deletion_queue: Arc<Mutex<Vec<GpuTextureId>>>,
+}
+
+impl<'a> AssetPostProcessor for GpuImageProcessor<'a> {
+    type Input = ImageAsset;
+    type Output = GpuImage;
+
+    fn process(&mut self, asset: &ImageAsset) -> Result<GpuImage> {
+        crate::upload_image_to_gpu(self.gl, asset, Arc::clone(&self.deletion_queue))
     }
 }

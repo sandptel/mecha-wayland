@@ -1,8 +1,11 @@
 #![allow(unused_variables, unused_mut, dead_code)]
 use anyhow::Result;
 use launcher::{profile_function, profile_scope};
-use renderer::{MonoSprite, Quad, Rect, Renderer, TextSystem};
 use renderer::primitives::RenderablePrimitive as _;
+use renderer::{GpuImage, Image, MonoSprite, Quad, Rect, Renderer, TextSystem};
+use utils::asset_manager::AssetManager;
+use utils::font::FontAsset;
+use utils::image::ImageAsset;
 use std::time::{Duration, Instant};
 use wayland_protocols::connection::Connection;
 use wayland_protocols::wl_callback::SyncCallback;
@@ -85,19 +88,34 @@ fn main() -> Result<()> {
 
     tracing::info!("sync complete, binding globals");
 
-    let (comp_name, comp_ver) = registry.find("wl_compositor").expect("wl_compositor missing");
+    let (comp_name, comp_ver) = registry
+        .find("wl_compositor")
+        .expect("wl_compositor missing");
     let (xdg_name, _) = registry.find("xdg_wm_base").expect("xdg_wm_base missing");
-    let (dmabuf_name, dmabuf_ver) =
-        registry.find("zwp_linux_dmabuf_v1").expect("zwp_linux_dmabuf_v1 missing");
+    let (dmabuf_name, dmabuf_ver) = registry
+        .find("zwp_linux_dmabuf_v1")
+        .expect("zwp_linux_dmabuf_v1 missing");
 
     let compositor = WlCompositor::new(conn.alloc_id());
     let wm_inner = XdgWmBase::new(conn.alloc_id());
     let dmabuf_inner = ZwpLinuxDmabufV1::new(conn.alloc_id());
 
-    registry.inner.bind(&mut conn, comp_name, "wl_compositor", comp_ver.min(4), &compositor)?;
-    registry.inner.bind(&mut conn, xdg_name, "xdg_wm_base", 1, &wm_inner)?;
     registry.inner.bind(
-        &mut conn, dmabuf_name, "zwp_linux_dmabuf_v1", dmabuf_ver.min(4), &dmabuf_inner,
+        &mut conn,
+        comp_name,
+        "wl_compositor",
+        comp_ver.min(4),
+        &compositor,
+    )?;
+    registry
+        .inner
+        .bind(&mut conn, xdg_name, "xdg_wm_base", 1, &wm_inner)?;
+    registry.inner.bind(
+        &mut conn,
+        dmabuf_name,
+        "zwp_linux_dmabuf_v1",
+        dmabuf_ver.min(4),
+        &dmabuf_inner,
     )?;
 
     let mut wm_base = WmBase::new(wm_inner);
@@ -108,7 +126,9 @@ fn main() -> Result<()> {
     let top_inner = XdgToplevel::new(conn.alloc_id());
 
     compositor.create_surface(&mut conn, &surface)?;
-    wm_base.inner.get_xdg_surface(&mut conn, &xdg_inner, &surface)?;
+    wm_base
+        .inner
+        .get_xdg_surface(&mut conn, &xdg_inner, &surface)?;
 
     let mut xdg_surf = XdgSurf::new(xdg_inner);
     let mut toplevel = Toplevel::new(top_inner);
@@ -127,9 +147,23 @@ fn main() -> Result<()> {
     let mut renderer = Renderer::new(WIDTH, HEIGHT)?;
     renderer.register::<Quad>()?;
     renderer.register::<MonoSprite>()?;
+    renderer.register::<Image>()?;
+
+    let mut assets = AssetManager::new();
+    let font_handle = assets.load::<FontAsset, _>("assets/Inter-Regular.ttf")?;
+    let logo_handle = assets.load::<ImageAsset, _>("assets/logo.png")?;
 
     let mut text_sys = TextSystem::new(renderer.gl(), 1024)?;
-    let font_id = text_sys.load_font(include_bytes!("../assets/Inter-Regular.ttf"))?;
+    let font_id = text_sys.load_font(&assets.get(&font_handle).unwrap().data)?;
+
+    assets
+        .process_pending(&mut renderer.image_processor())
+        .into_iter()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let logo = logo_handle.get_processed::<GpuImage>(&assets).unwrap();
+    let logo_w = logo.width as f32;
+    let logo_h = logo.height as f32;
+    let logo_tex = logo.id();
 
     let mut scene = renderer.create_scene();
     let render_surface = renderer.create_dmabuf_surface();
@@ -139,6 +173,12 @@ fn main() -> Result<()> {
     let start = Instant::now();
     let mut frame_count: u64 = 0;
     let mut last_fps_report = Instant::now();
+
+    let mut rect_x = 100.0f32;
+    let mut rect_y = 100.0f32;
+    let mut vel_x = 120.0f32; // Pixels per second (slow)
+    let mut vel_y = 90.0f32;
+    let mut last_update = Instant::now();
 
     loop {
         #[cfg(feature = "profile")]
@@ -168,9 +208,24 @@ fn main() -> Result<()> {
                 dmabuf.inner.create_params(&mut conn, &params)?;
                 let mod_hi = (frame.modifier >> 32) as u32;
                 let mod_lo = frame.modifier as u32;
-                params.add(&mut conn, frame.fd, 0, frame.offset, frame.stride, mod_hi, mod_lo)?;
+                params.add(
+                    &mut conn,
+                    frame.fd,
+                    0,
+                    frame.offset,
+                    frame.stride,
+                    mod_hi,
+                    mod_lo,
+                )?;
                 let buf = WlBuffer::new(conn.alloc_id());
-                params.create_immed(&mut conn, &buf, WIDTH as i32, HEIGHT as i32, frame.format, 0)?;
+                params.create_immed(
+                    &mut conn,
+                    &buf,
+                    WIDTH as i32,
+                    HEIGHT as i32,
+                    frame.format,
+                    0,
+                )?;
                 params.destroy(&mut conn)?;
                 wl_buf = Some(buf);
             }
@@ -181,39 +236,94 @@ fn main() -> Result<()> {
             let hue = (t * 72.0) % 360.0;
             let (r, g, b) = hsv_to_rgb(hue, 1.0, 1.0);
 
+            let rect_w = 200.0;
+            let rect_h = 100.0;
+
+            let now = Instant::now();
+            let mut dt = now.duration_since(last_update).as_secs_f32();
+            if dt > 0.1 {
+                dt = 0.1;
+            } // Prevent huge jumps if the frame stalls
+            last_update = now;
+
+            rect_x += vel_x * dt;
+            rect_y += vel_y * dt;
+
+            let max_x = WIDTH as f32 - rect_w;
+            let max_y = HEIGHT as f32 - 80.0 - rect_h; // Prevent overlapping bottom bar
+
+            // DVD-style bouncing logic
+            if rect_x <= 0.0 {
+                rect_x = 0.0;
+                vel_x = vel_x.abs();
+            } else if rect_x >= max_x {
+                rect_x = max_x;
+                vel_x = -vel_x.abs();
+            }
+
+            if rect_y <= 0.0 {
+                rect_y = 0.0;
+                vel_y = vel_y.abs();
+            } else if rect_y >= max_y {
+                rect_y = max_y;
+                vel_y = -vel_y.abs();
+            }
+
             {
                 profile_scope!("renderer");
-            scene.clear_primitives();
-            scene.background = (r * 0.15, g * 0.15, b * 0.15);
+                scene.clear_primitives();
+                scene.background = (1.0, 1.0, 1.0);
 
-            Quad {
-                bounds:    Rect { x: 50.0, y: 50.0, w: 200.0, h: 100.0 },
-                color:     [r, g, b, 1.0],
-                clip_rect: None,
-            }
-            .add_to_scene(&mut scene);
+                // The Moving "Hello, Wayland!" Rectangle
+                Quad {
+                    bounds: Rect {
+                        x: rect_x,
+                        y: rect_y,
+                        w: rect_w,
+                        h: rect_h,
+                    },
+                    color: [r, g, b, 1.0],
+                    clip_rect: None,
+                }
+                .add_to_scene(&mut scene);
 
-            Quad {
-                bounds:    Rect { x: 0.0, y: (HEIGHT - 80) as f32, w: WIDTH as f32, h: 80.0 },
-                color:     [1.0, 0.0, 0.0, 0.8],
-                clip_rect: None,
-            }
-            .add_to_scene(&mut scene);
+                // Static bottom red bar
+                Quad {
+                    bounds: Rect {
+                        x: 0.0,
+                        y: (HEIGHT - 80) as f32,
+                        w: WIDTH as f32,
+                        h: 80.0,
+                    },
+                    color: [1.0, 0.0, 0.0, 0.8],
+                    clip_rect: None,
+                }
+                .add_to_scene(&mut scene);
 
-            text_sys.draw_text(
-                &mut scene,
-                renderer.gl(),
-                "Hello, Wayland!",
-                font_id,
-                24.0,
-                [1.0, 1.0, 1.0, 1.0],
-                [60.0, 110.0],
-            )?;
+                // Draw text relatively positioned inside the moving rectangle
+                text_sys.draw_text(
+                    &mut scene,
+                    renderer.gl(),
+                    "Hello, Wayland!",
+                    font_id,
+                    24.0,
+                    [1.0, 1.0, 1.0, 1.0],
+                    [rect_x + 10.0, rect_y + 60.0],
+                )?;
 
-            renderer.begin_frame(&render_surface, scene.background);
-            renderer.render_primitive::<Quad>(&scene, &render_surface)?;
-            renderer.render_primitive::<MonoSprite>(&scene, &render_surface)?;
-            renderer.end_frame();
+                // Logo in the top-left corner
+                Image {
+                    bounds:    Rect { x: 20.0, y: 20.0, w: logo_w, h: logo_h },
+                    texture:   logo_tex,
+                    clip_rect: None,
+                }
+                .add_to_scene(&mut scene);
+
+                renderer.begin_frame(&render_surface, scene.background);
+                renderer.render_primitive::<Quad>(&scene, &render_surface)?;
+                renderer.render_primitive::<MonoSprite>(&scene, &render_surface)?;
+                renderer.render_primitive::<Image>(&scene, &render_surface)?;
+                renderer.end_frame();
             }
 
             {

@@ -244,3 +244,89 @@ impl RenderablePrimitive for MonoSprite {
     fn clip_rect(&self) -> Option<Rect> { self.clip }
     fn texture_id(&self) -> Option<GpuTextureId> { Some(GpuTextureId(self.atlas_tex)) }
 }
+
+// ── Image ──────────────────────────────────────────────────────────────────
+
+const IMAGE_VERT: &str = r#"#version 300 es
+precision mediump float;
+
+layout(location = 0) in vec4 i_screen_rect;
+layout(location = 1) in vec4 i_clip_rect;
+
+uniform vec2 u_viewport;
+
+out vec2 v_uv;
+out vec4 v_clip;
+
+void main() {
+    vec2 corner = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));
+    vec2 pos = mix(i_screen_rect.xy, i_screen_rect.zw, corner);
+    vec2 ndc = pos / u_viewport * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    v_uv   = corner;
+    v_clip = i_clip_rect;
+}
+"#;
+
+const IMAGE_FRAG: &str = r#"#version 300 es
+precision mediump float;
+
+uniform sampler2D u_atlas;
+
+in vec2 v_uv;
+in vec4 v_clip;
+
+out vec4 frag_color;
+
+void main() {
+    if (gl_FragCoord.x < v_clip.x || gl_FragCoord.x > v_clip.z ||
+        gl_FragCoord.y < v_clip.y || gl_FragCoord.y > v_clip.w) {
+        discard;
+    }
+    frag_color = texture(u_atlas, v_uv);
+}
+"#;
+
+/// A full-color RGBA image drawn into a screen-space rectangle.
+pub struct Image {
+    pub bounds:    Rect,
+    pub texture:   GpuTextureId,
+    pub clip_rect: Option<Rect>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct ImageInstance {
+    screen_rect: [f32; 4],
+    clip_rect:   [f32; 4],
+    _pad:        [f32; 8],
+}
+
+impl RenderablePrimitive for Image {
+    type InstanceData = ImageInstance;
+
+    fn vert_src() -> &'static str { IMAGE_VERT }
+    fn frag_src() -> &'static str { IMAGE_FRAG }
+
+    fn attrib_layout() -> &'static [AttribDesc] {
+        const L: &[AttribDesc] = &[
+            AttribDesc { location: 0, size: 4, stride: 64, offset: 0  },
+            AttribDesc { location: 1, size: 4, stride: 64, offset: 16 },
+        ];
+        L
+    }
+
+    fn to_instance(&self) -> ImageInstance {
+        let clip = self.clip_rect.unwrap_or(Rect { x: 0.0, y: 0.0, w: 1e9, h: 1e9 });
+        ImageInstance {
+            screen_rect: [self.bounds.x, self.bounds.y,
+                          self.bounds.x + self.bounds.w, self.bounds.y + self.bounds.h],
+            clip_rect:   [clip.x, clip.y, clip.x + clip.w, clip.y + clip.h],
+            _pad:        [0.0; 8],
+        }
+    }
+
+    fn bounding_box(&self) -> Rect { self.bounds }
+    fn clip_rect(&self) -> Option<Rect> { self.clip_rect }
+    fn texture_id(&self) -> Option<GpuTextureId> { Some(self.texture) }
+}
