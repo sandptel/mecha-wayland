@@ -1,0 +1,63 @@
+name: Continuous Benchmarks
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  # Required to push the visualization website to the gh-pages branch
+  contents: write
+  # Required to leave benchmark comparison comments on PRs
+  pull-requests: write
+
+jobs:
+  benchmark:
+    name: Run Criterion Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libgbm-dev \
+            libdrm-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+        # prevents wasting time in re-compilation again and again
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "benchmark-cache"
+
+      - name: Run cargo bench
+        # Criterion outputs in 'bencher' format which the action can parse
+        run: cargo bench | tee output.txt
+
+      - name: Process and Store Benchmark Results
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Rust Benchmark
+          tool: "cargo"
+          output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          # Only push historical data to the gh-pages branch on main merges
+          auto-push: ${{ github.event_name == 'push' }}
+
+          # Add a comment to the PR with the performance diff
+          comment-always: true
+
+          # Add the results to the GitHub Actions Job Summary
+          summary-always: true
+
+          # Optional: Mark workflow as failed if performance drops by more than 50%
+          alert-threshold: "150%"
+          fail-on-alert: false
